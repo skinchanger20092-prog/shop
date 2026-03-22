@@ -110,6 +110,9 @@ ACTIVE_ORDER_STATUSES = {
     "Оформляет заказ",
     "Отправляет данные",
     "Заявка отправлена",
+    "Ожидает оплату",
+    "Оплата на проверке",
+    "Оплачен",
     "Заказ обработан",
 }
 
@@ -127,6 +130,8 @@ china_order_users: set[int] = set()
 admin_search_users: set[int] = set()
 paid_search_users: set[int] = set()
 tracking_lookup_users: set[int] = set()
+support_users: set[int] = set()
+payment_users: set[int] = set()
 admin_cargo_order_states: dict[int, dict] = {}
 admin_cargo_active_workbooks: dict[int, str] = {}
 admin_message_order_states: dict[int, dict] = {}
@@ -179,6 +184,15 @@ china_submit_keyboard = ReplyKeyboardMarkup(
     ],
     resize_keyboard=True,
     input_field_placeholder="Отправь данные по заказу или нажми кнопку ниже",
+)
+
+payment_keyboard = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="Оплатить заказ")],
+        [KeyboardButton(text="Назад")],
+    ],
+    resize_keyboard=True,
+    input_field_placeholder="Нажми кнопку для отправки оплаты",
 )
 
 info_keyboard = ReplyKeyboardMarkup(
@@ -741,7 +755,7 @@ def assign_order_number(user_id: int) -> int | None:
 def can_approve_order(user: dict | None) -> bool:
     if not user:
         return False
-    return user.get("status") in {"Заявка отправлена", "Отправляет данные"}
+    return user.get("status") in {"Заявка отправлена", "Отправляет данные", "Оплачен"}
 
 
 def can_cancel_order(user: dict | None) -> bool:
@@ -756,6 +770,9 @@ def can_cancel_order(user: dict | None) -> bool:
             "Оформляет заказ",
             "Отправляет данные",
             "Заявка отправлена",
+            "Ожидает оплату",
+            "Оплата на проверке",
+            "Оплачен",
             "Заказ обработан",
         }
     )
@@ -765,7 +782,7 @@ def get_pending_orders() -> list[dict]:
     users = load_users()
     pending = [
         user for user in users.values()
-        if user.get("status") in {"Заявка отправлена", "Отправляет данные"}
+        if user.get("status") in {"Заявка отправлена", "Отправляет данные", "Ожидает оплату", "Оплата на проверке"}
     ]
     pending.sort(key=lambda item: item.get("last_seen", ""), reverse=True)
     return pending
@@ -1075,6 +1092,8 @@ def current_main_keyboard(message: Message) -> ReplyKeyboardMarkup:
 def clear_admin_cargo_mode(message: Message) -> None:
     if not message.from_user:
         return
+    support_users.discard(message.from_user.id)
+    payment_users.discard(message.from_user.id)
     reset_admin_cargo_order_state(message.from_user.id)
     reset_admin_message_order_state(message.from_user.id)
 
@@ -1845,6 +1864,8 @@ async def setup_bot_commands(bot: Bot) -> None:
         BotCommand(command="ban", description="Забанить пользователя"),
         BotCommand(command="unban", description="Разбанить пользователя"),
         BotCommand(command="banned", description="Список забаненных"),
+        BotCommand(command="payreq", description="Отправить реквизиты на оплату"),
+        BotCommand(command="paid", description="Подтвердить оплату"),
         BotCommand(command="randomuser", description="Случайный пользователь"),
         BotCommand(command="adminfun", description="Случайная админ-фраза"),
     ]
@@ -1876,6 +1897,22 @@ async def notify_admin(bot: Bot, message: Message) -> None:
         "Чтобы ответить, используй:\n"
         "/send user_id текст\n"
         "/done user_id",
+    )
+
+
+async def notify_admin_support(bot: Bot, message: Message) -> None:
+    if not message.from_user or message.from_user.id == ADMIN_ID:
+        return
+
+    username = f"@{message.from_user.username}" if message.from_user.username else "без username"
+    await bot.send_message(
+        ADMIN_ID,
+        "Новый вопрос в техподдержку:\n\n"
+        f"ID: {message.from_user.id}\n"
+        f"Имя: {message.from_user.full_name}\n"
+        f"Username: {username}\n\n"
+        "Чтобы ответить, используй:\n"
+        f"/send {message.from_user.id} текст"
     )
 
 
@@ -2029,6 +2066,8 @@ async def admin_panel(message: Message) -> None:
         "/ban user_id причина - забанить пользователя\n"
         "/unban user_id - разбанить пользователя\n"
         "/banned - список забаненных пользователей\n"
+        "/payreq user_id реквизиты - отправить реквизиты на оплату\n"
+        "/paid user_id - отметить оплату как подтвержденную\n"
         "/send user_id текст - отправить сообщение пользователю\n"
         "/broadcast текст - отправить сообщение всем пользователям\n"
         "/maintenance on|off - включить или выключить техобслуживание\n"
@@ -2484,6 +2523,86 @@ async def admin_banned_users(message: Message) -> None:
 
     lines = [format_order_card(user) for user in banned_users]
     await send_long_text(message, "Забаненные пользователи:\n\n" + "\n\n".join(lines))
+
+
+@dp.message(Command("payreq"))
+async def admin_send_payment_details(message: Message, bot: Bot) -> None:
+    if not is_admin(message):
+        await message.answer("У тебя нет доступа к этой команде.")
+        return
+
+    parts = (message.text or "").split(maxsplit=2)
+    if len(parts) < 3:
+        await message.answer("Используй формат: /payreq user_id реквизиты")
+        return
+
+    try:
+        user_id = int(parts[1].strip())
+    except ValueError:
+        await message.answer("user_id должен быть числом.")
+        return
+
+    user = get_user(user_id)
+    if not user:
+        await message.answer("Пользователь не найден.")
+        return
+
+    payment_text = parts[2].strip()
+    if not payment_text:
+        await message.answer("Реквизиты не могут быть пустыми.")
+        return
+
+    try:
+        await bot.send_message(
+            user_id,
+            "Реквизиты для оплаты:\n\n"
+            f"{payment_text}\n\n"
+            "После оплаты пришли сюда чек или сообщение с подтверждением.",
+            reply_markup=payment_keyboard,
+        )
+    except Exception as error:
+        await message.answer(f"Не удалось отправить реквизиты: {error}")
+        return
+
+    payment_users.add(user_id)
+    set_user_status(user_id, "Ожидает оплату")
+    await message.answer(f"Реквизиты отправлены пользователю {user_id}.")
+
+
+@dp.message(Command("paid"))
+async def admin_mark_paid(message: Message, bot: Bot) -> None:
+    if not is_admin(message):
+        await message.answer("У тебя нет доступа к этой команде.")
+        return
+
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer("Используй формат: /paid user_id")
+        return
+
+    try:
+        user_id = int(parts[1].strip())
+    except ValueError:
+        await message.answer("user_id должен быть числом.")
+        return
+
+    user = get_user(user_id)
+    if not user:
+        await message.answer("Пользователь не найден.")
+        return
+
+    set_user_status(user_id, "Оплачен")
+    payment_users.discard(user_id)
+    try:
+        await bot.send_message(
+            user_id,
+            "Оплата подтверждена. Спасибо.\n"
+            "Дальше заказ перейдёт в обработку."
+        )
+    except Exception:
+        pass
+
+    await message.answer(f"Оплата пользователя {user_id} подтверждена.")
 
 
 @dp.message(Command("stats"))
@@ -3510,10 +3629,14 @@ async def support(message: Message) -> None:
         return
     clear_admin_cargo_mode(message)
     update_user(message)
+    if message.from_user:
+        support_users.add(message.from_user.id)
     await send_photo_or_text(
         message,
         SUPPORT_IMAGE,
-        "По всем вопросам техподдержки пиши: @ichov",
+        "Напиши свой вопрос сюда, и бот сразу перешлёт его в техподдержку.\n"
+        "Можно отправлять текст, фото и файлы.\n"
+        "Чтобы выйти, нажми 'Назад'.",
     )
 
 
@@ -3567,17 +3690,56 @@ async def finish_china_order(message: Message, bot: Bot) -> None:
         return
 
     order_number = assign_order_number(message.from_user.id)
-    update_user(message, country="Китай", status="Заявка отправлена")
+    update_user(message, country="Китай", status="Ожидает оплату")
     china_order_users.discard(message.from_user.id)
     await message.answer(
-        f"Готово, ожидайте. Ваш номер заказа: {order_number}",
-        reply_markup=current_main_keyboard(message),
+        f"Заказ оформлен. Ваш номер заказа: {order_number}\n"
+        "Чтобы получить реквизиты для оплаты, нажми 'Оплатить заказ'.",
+        reply_markup=payment_keyboard,
     )
     await bot.send_message(
         ADMIN_ID,
         f"Заказ №{order_number}\n"
         f"Пользователь {message.from_user.full_name} "
         f"(ID: {message.from_user.id}) завершил отправку данных по заказу из Китая.",
+    )
+
+
+@dp.message(F.text == "Оплатить заказ")
+async def request_payment_details(message: Message, bot: Bot) -> None:
+    if await maintenance_guard(message):
+        return
+    if is_rate_limited(message):
+        await maybe_send_rate_limit_notice(message)
+        return
+    if not message.from_user:
+        return
+
+    user = get_user(message.from_user.id)
+    if not user or not (
+        user.get("order_number", 0)
+        or user.get("status") in {"Ожидает оплату", "Оплата на проверке", "Оплачен"}
+    ):
+        update_user(message)
+        await message.answer("Сначала оформи заказ, а потом запрашивай оплату.")
+        return
+
+    payment_users.add(message.from_user.id)
+    update_user(message, status="Ожидает оплату")
+    await message.answer(
+        "Запрос на оплату отправлен администратору.\n"
+        "Как только админ пришлёт реквизиты, бот пересылает их сюда.\n"
+        "После оплаты отправь сюда чек или подтверждение.",
+        reply_markup=payment_keyboard,
+    )
+    await bot.send_message(
+        ADMIN_ID,
+        "Запрос на оплату:\n\n"
+        f"ID: {message.from_user.id}\n"
+        f"Имя: {message.from_user.full_name}\n"
+        f"Номер заказа: {user.get('order_number', 0) or 'Нет'}\n\n"
+        "Отправь реквизиты командой:\n"
+        f"/payreq {message.from_user.id} ТВОИ_РЕКВИЗИТЫ"
     )
 
 
@@ -3594,7 +3756,10 @@ async def back_to_main_menu(message: Message) -> None:
         admin_search_users.discard(message.from_user.id)
         paid_search_users.discard(message.from_user.id)
         tracking_lookup_users.discard(message.from_user.id)
+        support_users.discard(message.from_user.id)
+        payment_users.discard(message.from_user.id)
         reset_admin_cargo_order_state(message.from_user.id)
+        reset_admin_message_order_state(message.from_user.id)
     user_name = message.from_user.first_name if message.from_user else "друг"
     await send_main_menu(message, user_name)
 
@@ -3616,6 +3781,35 @@ async def handle_messages(message: Message, bot: Bot) -> None:
         return
 
     if await handle_admin_cargo_order_step(message, bot):
+        return
+
+    if message.from_user.id in support_users and not is_admin(message):
+        update_user(message, status="В техподдержке")
+        await notify_admin_support(bot, message)
+        await bot.forward_message(ADMIN_ID, message.chat.id, message.message_id)
+        await message.answer(
+            "Сообщение отправлено в техподдержку.\n"
+            "Если нужно, можешь написать ещё или нажать 'Назад'."
+        )
+        return
+
+    if message.from_user.id in payment_users and not is_admin(message):
+        update_user(message, status="Оплата на проверке")
+        await bot.send_message(
+            ADMIN_ID,
+            "Поступило подтверждение оплаты:\n\n"
+            f"ID: {message.from_user.id}\n"
+            f"Имя: {message.from_user.full_name}\n"
+            "Проверь сообщение ниже.\n"
+            f"Чтобы подтвердить оплату, используй /paid {message.from_user.id}"
+        )
+        await bot.forward_message(ADMIN_ID, message.chat.id, message.message_id)
+        payment_users.discard(message.from_user.id)
+        await message.answer(
+            "Подтверждение оплаты отправлено администратору.\n"
+            "Ожидай проверки.",
+            reply_markup=current_main_keyboard(message),
+        )
         return
 
     if message.from_user.id in admin_search_users and is_admin(message):
@@ -3711,6 +3905,8 @@ async def handle_messages(message: Message, bot: Bot) -> None:
                 "/ban user_id причина\n"
                 "/unban user_id\n"
                 "/banned\n"
+                "/payreq user_id реквизиты\n"
+                "/paid user_id\n"
                 "/owner код\n"
                 "/broadcast текст\n"
                 "/maintenance on|off\n"
