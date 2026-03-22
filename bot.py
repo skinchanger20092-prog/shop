@@ -2003,6 +2003,7 @@ async def admin_panel(message: Message) -> None:
         "/activeexcel - показать текущую активную таблицу\n"
         "/setactiveexcel [номер|имя] - сделать таблицу текущей\n"
         "/closeexcel - закрыть текущую активную таблицу\n"
+        "/excelsend [номер|имя|current] - отправить таблицу файлом\n"
         "/excelview [номер|имя|current] - показать содержимое таблицы\n"
         "/exceldelete [номер|имя|current] - удалить таблицу карго\n"
         "/exceledit [номер|имя|current] строка поле значение - изменить товар в таблице\n"
@@ -2152,6 +2153,43 @@ async def admin_close_excel_command(message: Message) -> None:
         f"Файл: {workbook_path.name}\n"
         "Следующий /excelorder создаст новую таблицу или попросит выбрать другую через /setactiveexcel."
     )
+
+
+@dp.message(Command("excelsend"))
+async def admin_excel_send_command(message: Message, bot: Bot) -> None:
+    if not is_admin(message):
+        await message.answer("У тебя нет доступа к этой команде.")
+        return
+
+    raw_reference = ""
+    if message.text:
+        parts = message.text.split(maxsplit=1)
+        if len(parts) > 1:
+            raw_reference = parts[1]
+
+    if not message.from_user:
+        return
+
+    workbook_path = resolve_cargo_workbook_reference(message.from_user.id, raw_reference)
+    if not workbook_path:
+        await message.answer(
+            "Таблица не найдена.\n"
+            "Используй /excelfiles, чтобы посмотреть список, или /excelsend current для текущей."
+        )
+        return
+
+    try:
+        await bot.send_document(
+            message.chat.id,
+            document=FSInputFile(str(workbook_path)),
+            caption=f"Таблица: {workbook_path.name}",
+        )
+    except Exception as error:
+        await message.answer(
+            "Не удалось отправить таблицу.\n"
+            f"Ошибка: {error}"
+        )
+        return
 
 
 @dp.message(Command("excelview"))
@@ -3647,6 +3685,7 @@ async def handle_messages(message: Message, bot: Bot) -> None:
                 "/activeexcel\n"
                 "/setactiveexcel номер\n"
                 "/closeexcel\n"
+                "/excelsend current\n"
                 "/excelview номер\n"
                 "/exceldelete номер\n"
                 "/exceledit current строка поле значение\n"
