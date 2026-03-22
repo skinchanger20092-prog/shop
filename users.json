@@ -1,0 +1,72 @@
+{
+  "7541282558": {
+    "id": 7541282558,
+    "first_name": "гиков",
+    "last_name": "",
+    "username": "geekovz",
+    "first_seen": "2026-03-21 02:46:16",
+    "last_seen": "2026-03-21 18:40:14",
+    "country": "Китай",
+    "status": "Заказ обработан",
+    "note": "",
+    "order_number": 2,
+    "tracking_code": "GEEKLOGK-1D23-42CC",
+    "tracking_stage": "Выкуплен"
+  },
+  "7976858272": {
+    "id": 7976858272,
+    "first_name": "бангдан",
+    "last_name": "гиков",
+    "username": "geeeekz",
+    "first_seen": "2026-03-21 02:43:22",
+    "last_seen": "2026-03-21 18:24:26",
+    "country": "Китай",
+    "status": "Заказ обработан",
+    "note": "",
+    "order_number": 1,
+    "tracking_code": "RK-2E171F",
+    "tracking_stage": "Приехал в РФ"
+  },
+  "7549034240": {
+    "id": 7549034240,
+    "first_name": "aberonov",
+    "last_name": "",
+    "username": "aberonov",
+    "first_seen": "2026-03-21 12:19:47",
+    "last_seen": "2026-03-21 12:22:57",
+    "country": "",
+    "status": "Запустил бота"
+  },
+  "8132466860": {
+    "id": 8132466860,
+    "first_name": "! Oi !",
+    "last_name": "",
+    "username": "xOixOixOix",
+    "first_seen": "2026-03-21 12:23:08",
+    "last_seen": "2026-03-21 12:23:24",
+    "country": "Китай",
+    "status": "В главном меню"
+  },
+  "1090283367": {
+    "id": 1090283367,
+    "first_name": "Матвей",
+    "last_name": "",
+    "username": "kazantiip2007",
+    "first_seen": "2026-03-21 13:08:30",
+    "last_seen": "2026-03-21 14:47:21",
+    "country": "Сша",
+    "status": "Временно закрыто",
+    "note": ""
+  },
+  "5333735692": {
+    "id": 5333735692,
+    "first_name": "Виктор",
+    "last_name": "",
+    "username": "remboyciti",
+    "first_seen": "2026-03-21 14:50:48",
+    "last_seen": "2026-03-21 14:59:28",
+    "country": "Китай",
+    "status": "Заказ обработан",
+    "note": ""
+  }
+}
