@@ -16,7 +16,7 @@ from urllib.parse import urljoin
 import aiohttp
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
-from aiogram.types import FSInputFile, KeyboardButton, Message, ReplyKeyboardMarkup
+from aiogram.types import BotCommand, BotCommandScopeChat, BotCommandScopeDefault, FSInputFile, KeyboardButton, Message, ReplyKeyboardMarkup
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 
@@ -1813,6 +1813,42 @@ async def send_photo_or_text(
         )
         return
     await message.answer(caption, reply_markup=reply_markup)
+
+
+async def setup_bot_commands(bot: Bot) -> None:
+    default_commands = [
+        BotCommand(command="start", description="Запустить бота"),
+        BotCommand(command="help", description="Помощь"),
+        BotCommand(command="track", description="Проверить статус заказа"),
+    ]
+    await bot.set_my_commands(default_commands, scope=BotCommandScopeDefault())
+
+    admin_commands = [
+        BotCommand(command="admin", description="Админ-панель"),
+        BotCommand(command="users", description="Список пользователей"),
+        BotCommand(command="orders", description="Все заказы"),
+        BotCommand(command="active", description="Активные заказы"),
+        BotCommand(command="today", description="Сводка за сегодня"),
+        BotCommand(command="dashboard", description="Быстрый дашборд"),
+        BotCommand(command="excelorder", description="Добавить товар в текущую таблицу"),
+        BotCommand(command="newexcelorder", description="Начать новую таблицу"),
+        BotCommand(command="messageorder", description="Собрать заказ в одно сообщение"),
+        BotCommand(command="excelfiles", description="Показать таблицы карго"),
+        BotCommand(command="activeexcel", description="Текущая активная таблица"),
+        BotCommand(command="setactiveexcel", description="Сделать таблицу текущей"),
+        BotCommand(command="closeexcel", description="Закрыть активную таблицу"),
+        BotCommand(command="excelsend", description="Отправить таблицу файлом"),
+        BotCommand(command="excelview", description="Посмотреть содержимое таблицы"),
+        BotCommand(command="exceldelete", description="Удалить таблицу"),
+        BotCommand(command="exceledit", description="Изменить строку в таблице"),
+        BotCommand(command="cargostats", description="Сводка по таблицам"),
+        BotCommand(command="ban", description="Забанить пользователя"),
+        BotCommand(command="unban", description="Разбанить пользователя"),
+        BotCommand(command="banned", description="Список забаненных"),
+        BotCommand(command="randomuser", description="Случайный пользователь"),
+        BotCommand(command="adminfun", description="Случайная админ-фраза"),
+    ]
+    await bot.set_my_commands(admin_commands, scope=BotCommandScopeChat(chat_id=ADMIN_ID))
 
 
 async def send_main_menu(message: Message, user_name: str) -> None:
@@ -3718,6 +3754,7 @@ async def main() -> None:
     purge_canceled_orders()
     ensure_storage_dirs()
     bot = Bot(token=TOKEN)
+    await setup_bot_commands(bot)
     await dp.start_polling(bot)
 
 
