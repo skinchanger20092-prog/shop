@@ -1,0 +1,2442 @@
+﻿import asyncio
+import json
+import logging
+import os
+import re
+import secrets
+import sqlite3
+import time
+from datetime import datetime
+from pathlib import Path
+from urllib.parse import urljoin
+
+import aiohttp
+from aiogram import Bot, Dispatcher, F
+from aiogram.filters import Command
+from aiogram.types import FSInputFile, KeyboardButton, Message, ReplyKeyboardMarkup
+from bs4 import BeautifulSoup
+from dotenv import load_dotenv
+
+
+load_dotenv()
+
+TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_ID = 7541282558
+BASE_DIR = Path(__file__).resolve().parent
+DB_FILE = BASE_DIR / "bot.db"
+USERS_FILE = BASE_DIR / "users.json"
+WELCOME_IMAGE = BASE_DIR / "Dobro.png"
+ORDER_IMAGE = BASE_DIR / "strana.png"
+TARIFF_IMAGE = BASE_DIR / "tarif.png"
+SUPPORT_IMAGE = BASE_DIR / "teh.png"
+INFO_IMAGE = BASE_DIR / "info.png"
+YUAN_IMAGE = BASE_DIR / "kurs.png"
+SEARCH_SOURCES = [
+    "https://www.goofish.com/",
+    "https://mxjstore.x.yupoo.com/albums",
+    "https://wwfake100.x.yupoo.com/albums",
+    "https://yolo66.x.yupoo.com/albums",
+    "https://vx798134596.x.yupoo.com/",
+    "https://konng-gonng.x.yupoo.com/",
+    "https://goat-official.x.yupoo.com/categories",
+    "https://huskyreps.x.yupoo.com/",
+    "https://powerball.x.yupoo.com/",
+    "https://anniestudio.x.yupoo.com/",
+    "https://repsking.x.yupoo.com/",
+    "https://loganhere.x.yupoo.com/",
+    "https://martinreps.x.yupoo.com/",
+    "https://windvane168.x.yupoo.com/",
+    "https://lufilostudio.x.yupoo.com/",
+    "https://rainbowreps.x.yupoo.com/",
+    "https://angelking47.x.yupoo.com/",
+    "https://pikachushop.x.yupoo.com/",
+]
+HTTP_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "ru,en-US;q=0.9,en;q=0.8",
+}
+REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=12)
+MAX_RESULTS = 8
+MAX_MESSAGES_PER_WINDOW = 8
+RATE_WINDOW_SECONDS = 10
+RATE_LIMIT_NOTICE_COOLDOWN = 5
+TRACKING_STAGES = {
+    "1": "Р’С‹РєСѓРїР»РµРЅ",
+    "2": "РџСЂРёРµС…Р°Р» РЅР° СЃРєР»Р°Рґ",
+    "3": "РћС‚РїСЂР°РІР»РµРЅ",
+    "4": "РџСЂРёРµС…Р°Р» РІ Р Р¤",
+}
+ACTIVE_ORDER_STATUSES = {
+    "РћС„РѕСЂРјР»СЏРµС‚ Р·Р°РєР°Р·",
+    "РћС‚РїСЂР°РІР»СЏРµС‚ РґР°РЅРЅС‹Рµ",
+    "Р—Р°СЏРІРєР° РѕС‚РїСЂР°РІР»РµРЅР°",
+    "Р—Р°РєР°Р· РѕР±СЂР°Р±РѕС‚Р°РЅ",
+}
+
+if not TOKEN:
+    raise RuntimeError("РќРµ РЅР°Р№РґРµРЅ BOT_TOKEN. Р”РѕР±Р°РІСЊ С‚РѕРєРµРЅ РІ С„Р°Р№Р» .env.")
+
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+
+dp = Dispatcher()
+china_order_users: set[int] = set()
+admin_search_users: set[int] = set()
+paid_search_users: set[int] = set()
+tracking_lookup_users: set[int] = set()
+search_semaphore = asyncio.Semaphore(3)
+user_request_times: dict[int, list[float]] = {}
+user_last_limit_notice: dict[int, float] = {}
+
+user_main_keyboard = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="Сделать заказ")],
+        [KeyboardButton(text="Тарифы")],
+        [KeyboardButton(text="Курс юаня")],
+        [KeyboardButton(text="Инфо")],
+        [KeyboardButton(text="Тех. поддержка")],
+    ],
+    resize_keyboard=True,
+    input_field_placeholder="Напиши сообщение или выбери кнопку",
+)
+
+admin_main_keyboard = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="Сделать заказ")],
+        [KeyboardButton(text="Найти эту вещь в Китае")],
+        [KeyboardButton(text="Неодобренные заказы")],
+        [KeyboardButton(text="Все заказы и их статусы")],
+        [KeyboardButton(text="Тарифы")],
+        [KeyboardButton(text="Курс юаня")],
+        [KeyboardButton(text="Инфо")],
+        [KeyboardButton(text="Тех. поддержка")],
+    ],
+    resize_keyboard=True,
+    input_field_placeholder="Напиши сообщение или выбери кнопку",
+)
+
+user_order_keyboard = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="Китай")],
+        [KeyboardButton(text="Найти эту вещь в Китае")],
+        [KeyboardButton(text="Назад")],
+    ],
+    resize_keyboard=True,
+    input_field_placeholder="Выбери раздел",
+)
+
+china_submit_keyboard = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="Я все скинул")],
+        [KeyboardButton(text="Назад")],
+    ],
+    resize_keyboard=True,
+    input_field_placeholder="Отправь данные по заказу или нажми кнопку ниже",
+)
+
+info_keyboard = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="Мой заказ")],
+        [KeyboardButton(text="Мои попытки поиска")],
+        [KeyboardButton(text="Узнать статус заказа")],
+        [KeyboardButton(text="Назад")],
+    ],
+    resize_keyboard=True,
+    input_field_placeholder="Выбери действие",
+)
+
+
+user_main_keyboard = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="Сделать заказ")],
+        [KeyboardButton(text="Тарифы")],
+        [KeyboardButton(text="Курс юаня")],
+        [KeyboardButton(text="Инфо")],
+        [KeyboardButton(text="Тех. поддержка")],
+    ],
+    resize_keyboard=True,
+    input_field_placeholder="Напиши сообщение или выбери кнопку",
+)
+
+admin_main_keyboard = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="Сделать заказ")],
+        [KeyboardButton(text="Найти эту вещь в Китае")],
+        [KeyboardButton(text="Неодобренные заказы")],
+        [KeyboardButton(text="Все заказы и их статусы")],
+        [KeyboardButton(text="Тарифы")],
+        [KeyboardButton(text="Курс юаня")],
+        [KeyboardButton(text="Инфо")],
+        [KeyboardButton(text="Тех. поддержка")],
+    ],
+    resize_keyboard=True,
+    input_field_placeholder="Напиши сообщение или выбери кнопку",
+)
+
+user_order_keyboard = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="Китай")],
+        [KeyboardButton(text="Найти эту вещь в Китае")],
+        [KeyboardButton(text="Назад")],
+    ],
+    resize_keyboard=True,
+    input_field_placeholder="Выбери раздел",
+)
+
+
+def now_str() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def get_db() -> sqlite3.Connection:
+    connection = sqlite3.connect(DB_FILE)
+    connection.row_factory = sqlite3.Row
+    return connection
+
+
+def init_db() -> None:
+    with get_db() as connection:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL DEFAULT ''
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY,
+                first_name TEXT NOT NULL DEFAULT '',
+                last_name TEXT NOT NULL DEFAULT '',
+                username TEXT NOT NULL DEFAULT '',
+                first_seen TEXT NOT NULL DEFAULT '',
+                last_seen TEXT NOT NULL DEFAULT '',
+                country TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT '',
+                note TEXT NOT NULL DEFAULT '',
+                search_access INTEGER NOT NULL DEFAULT 0,
+                order_number INTEGER NOT NULL DEFAULT 0,
+                tracking_code TEXT NOT NULL DEFAULT '',
+                tracking_stage TEXT NOT NULL DEFAULT ''
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_users_tracking_code
+            ON users(tracking_code)
+            WHERE tracking_code <> ''
+            """
+        )
+        columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(users)").fetchall()
+        }
+        if "search_access" not in columns:
+            connection.execute(
+                "ALTER TABLE users ADD COLUMN search_access INTEGER NOT NULL DEFAULT 0"
+            )
+
+
+def get_setting(key: str, default: str = "") -> str:
+    with get_db() as connection:
+        row = connection.execute(
+            "SELECT value FROM settings WHERE key = ?",
+            (key,),
+        ).fetchone()
+    if not row:
+        return default
+    return row["value"] or default
+
+
+def set_setting(key: str, value: str) -> None:
+    with get_db() as connection:
+        connection.execute(
+            """
+            INSERT INTO settings (key, value)
+            VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            """,
+            (key, value),
+        )
+
+
+def get_yuan_rate() -> str:
+    return get_setting("yuan_rate", "13,0")
+
+
+def set_yuan_rate(value: str) -> None:
+    set_setting("yuan_rate", value)
+
+
+def is_maintenance_mode() -> bool:
+    return get_setting("maintenance_mode", "0") == "1"
+
+
+def set_maintenance_mode(enabled: bool) -> None:
+    set_setting("maintenance_mode", "1" if enabled else "0")
+
+
+def row_to_user(row: sqlite3.Row) -> dict:
+    return {
+        "id": row["id"],
+        "first_name": row["first_name"] or "",
+        "last_name": row["last_name"] or "",
+        "username": row["username"] or "",
+        "first_seen": row["first_seen"] or "",
+        "last_seen": row["last_seen"] or "",
+        "country": row["country"] or "",
+        "status": row["status"] or "",
+        "note": row["note"] or "",
+        "search_access": int(row["search_access"] or 0),
+        "order_number": int(row["order_number"] or 0),
+        "tracking_code": row["tracking_code"] or "",
+        "tracking_stage": row["tracking_stage"] or "",
+    }
+
+
+def load_legacy_users() -> dict[str, dict]:
+    if not USERS_FILE.exists():
+        return {}
+
+    try:
+        data = json.loads(USERS_FILE.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (json.JSONDecodeError, OSError):
+        logging.warning("РќРµ СѓРґР°Р»РѕСЃСЊ РїСЂРѕС‡РёС‚Р°С‚СЊ users.json, РїСЂРѕРїСѓСЃРєР°СЋ РјРёРіСЂР°С†РёСЋ.")
+        return {}
+
+
+def migrate_legacy_users() -> None:
+    legacy_users = load_legacy_users()
+    if not legacy_users:
+        return
+
+    with get_db() as connection:
+        existing_count = connection.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        if existing_count:
+            return
+
+        for raw_user in legacy_users.values():
+            user_id = int(raw_user.get("id", 0) or 0)
+            if not user_id:
+                continue
+
+            connection.execute(
+                """
+                INSERT OR REPLACE INTO users (
+                    id, first_name, last_name, username,
+                    first_seen, last_seen, country, status,
+                    note, search_access, order_number, tracking_code, tracking_stage
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    user_id,
+                    raw_user.get("first_name", "") or "",
+                    raw_user.get("last_name", "") or "",
+                    raw_user.get("username", "") or "",
+                    raw_user.get("first_seen", "") or now_str(),
+                    raw_user.get("last_seen", "") or now_str(),
+                    raw_user.get("country", "") or "",
+                    raw_user.get("status", "РќРѕРІС‹Р№") or "РќРѕРІС‹Р№",
+                    raw_user.get("note", "") or "",
+                    int(raw_user.get("search_access", 0) or 0),
+                    int(raw_user.get("order_number", 0) or 0),
+                    raw_user.get("tracking_code", "") or "",
+                    raw_user.get("tracking_stage", "") or "",
+                ),
+            )
+
+
+def load_users() -> dict[str, dict]:
+    try:
+        with get_db() as connection:
+            rows = connection.execute("SELECT * FROM users ORDER BY id").fetchall()
+    except sqlite3.OperationalError as error:
+        if "no such table: users" not in str(error).lower():
+            raise
+        init_db()
+        with get_db() as connection:
+            rows = connection.execute("SELECT * FROM users ORDER BY id").fetchall()
+    return {str(row["id"]): row_to_user(row) for row in rows}
+
+
+def save_users(users: dict[str, dict]) -> None:
+    with get_db() as connection:
+        for user in users.values():
+            user_id = int(user.get("id", 0) or 0)
+            if not user_id:
+                continue
+
+            connection.execute(
+                """
+                INSERT INTO users (
+                    id, first_name, last_name, username,
+                    first_seen, last_seen, country, status,
+                    note, search_access, order_number, tracking_code, tracking_stage
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    first_name=excluded.first_name,
+                    last_name=excluded.last_name,
+                    username=excluded.username,
+                    first_seen=excluded.first_seen,
+                    last_seen=excluded.last_seen,
+                    country=excluded.country,
+                    status=excluded.status,
+                    note=excluded.note,
+                    search_access=excluded.search_access,
+                    order_number=excluded.order_number,
+                    tracking_code=excluded.tracking_code,
+                    tracking_stage=excluded.tracking_stage
+                """,
+                (
+                    user_id,
+                    user.get("first_name", "") or "",
+                    user.get("last_name", "") or "",
+                    user.get("username", "") or "",
+                    user.get("first_seen", "") or now_str(),
+                    user.get("last_seen", "") or now_str(),
+                    user.get("country", "") or "",
+                    user.get("status", "РќРѕРІС‹Р№") or "РќРѕРІС‹Р№",
+                    user.get("note", "") or "",
+                    int(user.get("search_access", 0) or 0),
+                    int(user.get("order_number", 0) or 0),
+                    user.get("tracking_code", "") or "",
+                    user.get("tracking_stage", "") or "",
+                ),
+            )
+
+def update_user(
+    message: Message,
+    *,
+    country: str | None = None,
+    status: str | None = None,
+) -> dict | None:
+    if not message.from_user:
+        return None
+
+    users = load_users()
+    user_id = str(message.from_user.id)
+    existing = users.get(user_id, {})
+
+    user_data = {
+        "id": message.from_user.id,
+        "first_name": message.from_user.first_name or "",
+        "last_name": message.from_user.last_name or "",
+        "username": message.from_user.username or "",
+        "first_seen": existing.get("first_seen", now_str()),
+        "last_seen": now_str(),
+        "country": country if country is not None else existing.get("country", ""),
+        "status": status if status is not None else existing.get("status", "РќРѕРІС‹Р№"),
+        "note": existing.get("note", ""),
+        "search_access": int(existing.get("search_access", 0) or 0),
+        "order_number": existing.get("order_number", 0),
+        "tracking_code": existing.get("tracking_code", ""),
+        "tracking_stage": existing.get("tracking_stage", ""),
+    }
+
+    users[user_id] = user_data
+    save_users(users)
+    return user_data
+
+
+def get_user(user_id: int) -> dict | None:
+    return load_users().get(str(user_id))
+
+
+def get_user_by_tracking_code(tracking_code: str) -> tuple[str | None, dict | None]:
+    users = load_users()
+    normalized = tracking_code.strip().upper()
+    for key, user in users.items():
+        if (user.get("tracking_code", "") or "").upper() == normalized:
+            return key, user
+    return None, None
+
+
+def get_user_by_order_number(order_number: int) -> dict | None:
+    users = load_users()
+    for user in users.values():
+        if int(user.get("order_number", 0) or 0) == order_number:
+            return user
+    return None
+
+
+def set_user_status(user_id: int, status: str) -> None:
+    users = load_users()
+    key = str(user_id)
+    if key not in users:
+        return
+    users[key]["status"] = status
+    users[key]["last_seen"] = now_str()
+    save_users(users)
+
+
+def set_user_note(user_id: int, note: str) -> bool:
+    users = load_users()
+    key = str(user_id)
+    if key not in users:
+        return False
+    users[key]["note"] = note
+    users[key]["last_seen"] = now_str()
+    save_users(users)
+    return True
+
+
+def assign_order_number(user_id: int) -> int | None:
+    users = load_users()
+    key = str(user_id)
+    if key not in users:
+        return None
+
+    existing_number = users[key].get("order_number", 0)
+    if existing_number:
+        return existing_number
+
+    last_number = max((int(user.get("order_number", 0)) for user in users.values()), default=0)
+    new_number = last_number + 1
+    users[key]["order_number"] = new_number
+    users[key]["last_seen"] = now_str()
+    save_users(users)
+    return new_number
+
+
+def can_approve_order(user: dict | None) -> bool:
+    if not user:
+        return False
+    return user.get("status") in {"Р—Р°СЏРІРєР° РѕС‚РїСЂР°РІР»РµРЅР°", "РћС‚РїСЂР°РІР»СЏРµС‚ РґР°РЅРЅС‹Рµ"}
+
+
+def can_cancel_order(user: dict | None) -> bool:
+    if not user:
+        return False
+    if user.get("status") == "Р—Р°РєР°Р· РѕС‚РјРµРЅРµРЅ":
+        return False
+    return bool(
+        user.get("order_number", 0)
+        or user.get("tracking_code")
+        or user.get("status") in {
+            "РћС„РѕСЂРјР»СЏРµС‚ Р·Р°РєР°Р·",
+            "РћС‚РїСЂР°РІР»СЏРµС‚ РґР°РЅРЅС‹Рµ",
+            "Р—Р°СЏРІРєР° РѕС‚РїСЂР°РІР»РµРЅР°",
+            "Р—Р°РєР°Р· РѕР±СЂР°Р±РѕС‚Р°РЅ",
+        }
+    )
+
+
+def get_pending_orders() -> list[dict]:
+    users = load_users()
+    pending = [
+        user for user in users.values()
+        if user.get("status") in {"Р—Р°СЏРІРєР° РѕС‚РїСЂР°РІР»РµРЅР°", "РћС‚РїСЂР°РІР»СЏРµС‚ РґР°РЅРЅС‹Рµ"}
+    ]
+    pending.sort(key=lambda item: item.get("last_seen", ""), reverse=True)
+    return pending
+
+
+def get_all_orders() -> list[dict]:
+    users = load_users()
+    orders = [
+        user for user in users.values()
+        if (
+            user.get("order_number", 0)
+            or user.get("tracking_code")
+            or user.get("status") in ACTIVE_ORDER_STATUSES
+        )
+    ]
+    orders.sort(
+        key=lambda item: (
+            int(item.get("order_number", 0) or 0),
+            item.get("last_seen", ""),
+        ),
+        reverse=True,
+    )
+    return orders
+
+
+def get_active_orders() -> list[dict]:
+    return [
+        user for user in get_all_orders()
+        if user.get("tracking_stage") != TRACKING_STAGES["4"]
+    ]
+
+
+def get_tracked_orders() -> list[dict]:
+    orders = [user for user in get_all_orders() if user.get("tracking_code")]
+    orders.sort(key=lambda item: item.get("last_seen", ""), reverse=True)
+    return orders
+
+
+def get_recent_users(limit: int = 10) -> list[dict]:
+    users = load_users()
+    recent = sorted(users.values(), key=lambda item: item.get("last_seen", ""), reverse=True)
+    return recent[:limit]
+
+
+def get_today_stats() -> dict[str, int]:
+    today_prefix = datetime.now().strftime("%Y-%m-%d")
+    users = list(load_users().values())
+    return {
+        "new_users": sum(1 for user in users if (user.get("first_seen", "") or "").startswith(today_prefix)),
+        "active_today": sum(1 for user in users if (user.get("last_seen", "") or "").startswith(today_prefix)),
+        "orders_today": sum(
+            1
+            for user in users
+            if int(user.get("order_number", 0) or 0) > 0 and (user.get("last_seen", "") or "").startswith(today_prefix)
+        ),
+        "processed_today": sum(
+            1
+            for user in users
+            if user.get("status") == "Р—Р°РєР°Р· РѕР±СЂР°Р±РѕС‚Р°РЅ" and (user.get("last_seen", "") or "").startswith(today_prefix)
+        ),
+    }
+
+
+def get_search_access_users() -> list[dict]:
+    users = load_users()
+    access_users = [user for user in users.values() if int(user.get("search_access", 0) or 0) > 0]
+    access_users.sort(key=lambda item: item.get("last_seen", ""), reverse=True)
+    return access_users
+
+
+def search_users(query: str, limit: int = 12) -> list[dict]:
+    normalized_query = normalize_query(query)
+    if not normalized_query:
+        return []
+
+    results: list[dict] = []
+    for user in load_users().values():
+        haystack = normalize_query(
+            " ".join(
+                [
+                    str(user.get("id", "")),
+                    user.get("first_name", "") or "",
+                    user.get("last_name", "") or "",
+                    user.get("username", "") or "",
+                    user.get("country", "") or "",
+                    user.get("status", "") or "",
+                    user.get("note", "") or "",
+                    str(user.get("order_number", 0) or ""),
+                    user.get("tracking_code", "") or "",
+                    user.get("tracking_stage", "") or "",
+                ]
+            )
+        )
+        if normalized_query in haystack:
+            results.append(user)
+
+    results.sort(key=lambda item: item.get("last_seen", ""), reverse=True)
+    return results[:limit]
+
+
+def add_search_credits(user_id: int, amount: int) -> int | None:
+    users = load_users()
+    key = str(user_id)
+    if key not in users or amount <= 0:
+        return None
+
+    current = int(users[key].get("search_access", 0) or 0)
+    users[key]["search_access"] = current + amount
+    users[key]["last_seen"] = now_str()
+    save_users(users)
+    return int(users[key]["search_access"])
+
+
+def set_search_credits(user_id: int, amount: int) -> int | None:
+    users = load_users()
+    key = str(user_id)
+    if key not in users:
+        return None
+
+    users[key]["search_access"] = max(0, int(amount))
+    users[key]["last_seen"] = now_str()
+    save_users(users)
+    return int(users[key]["search_access"])
+
+
+def consume_search_credit(user_id: int) -> int | None:
+    users = load_users()
+    key = str(user_id)
+    if key not in users:
+        return None
+
+    current = int(users[key].get("search_access", 0) or 0)
+    if current <= 0:
+        return None
+
+    users[key]["search_access"] = current - 1
+    users[key]["last_seen"] = now_str()
+    save_users(users)
+    return int(users[key]["search_access"])
+
+
+def format_order_card(user: dict, *, include_action_hint: bool = False) -> str:
+    username = f"@{user['username']}" if user.get("username") else "Р±РµР· username"
+    full_name = " ".join(
+        part for part in [user.get("first_name", ""), user.get("last_name", "")] if part
+    ).strip() or "Р‘РµР· РёРјРµРЅРё"
+
+    lines = [
+        f"Р—Р°РєР°Р· в„–{user.get('order_number', 0) or '-'}",
+        f"ID: {user['id']}",
+        f"РРјСЏ: {full_name}",
+        f"Username: {username}",
+        f"РЎС‚СЂР°РЅР°: {user.get('country', '') or 'РќРµ РІС‹Р±СЂР°РЅР°'}",
+        f"РЎС‚Р°С‚СѓСЃ: {user.get('status', '') or 'РќРѕРІС‹Р№'}",
+        f"РџРѕРїС‹С‚РѕРє РїРѕРёСЃРєР°: {int(user.get('search_access', 0) or 0)}",
+        f"РўСЂРµРє-РєРѕРґ: {user.get('tracking_code', '') or 'РќРµС‚'}",
+        f"Р­С‚Р°Рї: {user.get('tracking_stage', '') or 'РќРµС‚'}",
+        f"РћР±РЅРѕРІР»РµРЅ: {user.get('last_seen', '-')}",
+    ]
+
+    if include_action_hint and user.get("status") in {"Р—Р°СЏРІРєР° РѕС‚РїСЂР°РІР»РµРЅР°", "РћС‚РїСЂР°РІР»СЏРµС‚ РґР°РЅРЅС‹Рµ"}:
+        lines.append(f"Р”Р»СЏ РѕРґРѕР±СЂРµРЅРёСЏ: /done {user['id']}")
+    if include_action_hint and user.get("status") != "Р—Р°РєР°Р· РѕС‚РјРµРЅРµРЅ":
+        lines.append(f"Р”Р»СЏ РѕС‚РјРµРЅС‹: /cancel {user['id']}")
+
+    return "\n".join(lines)
+
+
+def generate_tracking_code() -> str:
+    random_code = secrets.token_hex(5).upper()
+    return f"GEEKLOGK-{random_code[:5]}-{random_code[5:]}"
+
+
+def assign_tracking_code(user_id: int) -> str | None:
+    users = load_users()
+    key = str(user_id)
+    if key not in users:
+        return None
+
+    existing_codes = {
+        (user.get("tracking_code", "") or "").upper()
+        for user in users.values()
+        if user.get("tracking_code")
+    }
+
+    tracking_code = generate_tracking_code()
+    while tracking_code.upper() in existing_codes:
+        tracking_code = generate_tracking_code()
+
+    users[key]["tracking_code"] = tracking_code
+    users[key]["tracking_stage"] = TRACKING_STAGES["1"]
+    users[key]["last_seen"] = now_str()
+    save_users(users)
+    return tracking_code
+
+
+def set_tracking_stage(tracking_code: str, stage_key: str) -> dict | None:
+    user_key, user = get_user_by_tracking_code(tracking_code)
+    if not user_key or not user:
+        return None
+
+    stage = TRACKING_STAGES.get(stage_key)
+    if not stage:
+        return None
+
+    users = load_users()
+    users[user_key]["tracking_stage"] = stage
+    users[user_key]["last_seen"] = now_str()
+    save_users(users)
+    return users[user_key]
+
+
+def cancel_user_order(user_id: int) -> dict | None:
+    users = load_users()
+    key = str(user_id)
+    if key not in users:
+        return None
+
+    users[key]["country"] = ""
+    users[key]["status"] = "РќРѕРІС‹Р№"
+    users[key]["order_number"] = 0
+    users[key]["tracking_code"] = ""
+    users[key]["tracking_stage"] = ""
+    users[key]["last_seen"] = now_str()
+    save_users(users)
+    return users[key]
+
+
+def purge_canceled_orders() -> None:
+    users = load_users()
+    changed = False
+
+    for user in users.values():
+        if user.get("status") != "Р—Р°РєР°Р· РѕС‚РјРµРЅРµРЅ":
+            continue
+
+        user["country"] = ""
+        user["status"] = "РќРѕРІС‹Р№"
+        user["order_number"] = 0
+        user["tracking_code"] = ""
+        user["tracking_stage"] = ""
+        user["last_seen"] = now_str()
+        changed = True
+
+    if changed:
+        save_users(users)
+
+
+def is_admin(message: Message) -> bool:
+    return bool(message.from_user and message.from_user.id == ADMIN_ID)
+
+
+async def maintenance_guard(message: Message) -> bool:
+    if is_admin(message):
+        return False
+    if not is_maintenance_mode():
+        return False
+
+    await message.answer("Р‘РѕС‚ РІСЂРµРјРµРЅРЅРѕ РЅР°С…РѕРґРёС‚СЃСЏ РЅР° С‚РµС…РѕР±СЃР»СѓР¶РёРІР°РЅРёРё. РџРѕРїСЂРѕР±СѓР№ РЅР°РїРёСЃР°С‚СЊ РїРѕР·Р¶Рµ.")
+    return True
+
+
+def is_rate_limited(message: Message) -> bool:
+    if not message.from_user:
+        return False
+    if is_admin(message):
+        return False
+
+    user_id = message.from_user.id
+    now = time.monotonic()
+    history = user_request_times.get(user_id, [])
+    history = [stamp for stamp in history if now - stamp <= RATE_WINDOW_SECONDS]
+    history.append(now)
+    user_request_times[user_id] = history
+    return len(history) > MAX_MESSAGES_PER_WINDOW
+
+
+async def maybe_send_rate_limit_notice(message: Message) -> None:
+    if not message.from_user:
+        return
+
+    user_id = message.from_user.id
+    now = time.monotonic()
+    last_notice = user_last_limit_notice.get(user_id, 0)
+    if now - last_notice < RATE_LIMIT_NOTICE_COOLDOWN:
+        return
+
+    user_last_limit_notice[user_id] = now
+    await message.answer("РЎР»РёС€РєРѕРј РјРЅРѕРіРѕ СЃРѕРѕР±С‰РµРЅРёР№ РїРѕРґСЂСЏРґ. РџРѕРґРѕР¶РґРё РїР°СЂСѓ СЃРµРєСѓРЅРґ Рё РѕС‚РїСЂР°РІСЊ СЃРЅРѕРІР°.")
+
+
+def current_main_keyboard(message: Message) -> ReplyKeyboardMarkup:
+    return admin_main_keyboard if is_admin(message) else user_main_keyboard
+
+
+def normalize_query(text: str) -> str:
+    return re.sub(r"\s+", " ", text.strip().lower())
+
+
+def tokenize_query(text: str) -> list[str]:
+    return [token for token in re.split(r"\W+", normalize_query(text)) if len(token) > 1]
+
+
+def build_result_text(results: list[dict]) -> str:
+    if not results:
+        return "РќРёС‡РµРіРѕ РЅРµ РЅР°С€РµР» РїРѕ СЌС‚РѕРјСѓ Р·Р°РїСЂРѕСЃСѓ. РџРѕРїСЂРѕР±СѓР№ РЅР°РїРёСЃР°С‚СЊ С‚РѕС‡РЅРµРµ РјРѕРґРµР»СЊ, Р±СЂРµРЅРґ РёР»Рё С†РІРµС‚."
+
+    lines = ["Р’РѕС‚ С‡С‚Рѕ СѓРґР°Р»РѕСЃСЊ РЅР°Р№С‚Рё:"]
+    for index, result in enumerate(results[:MAX_RESULTS], start=1):
+        lines.append(f"{index}. {result['title'][:120]}\n{result['url']}")
+    return "\n\n".join(lines)
+
+
+def split_text_chunks(text: str, limit: int = 3500) -> list[str]:
+    if len(text) <= limit:
+        return [text]
+
+    chunks: list[str] = []
+    current = ""
+    for block in text.split("\n\n"):
+        candidate = block if not current else f"{current}\n\n{block}"
+        if len(candidate) <= limit:
+            current = candidate
+            continue
+
+        if current:
+            chunks.append(current)
+            current = ""
+
+        while len(block) > limit:
+            chunks.append(block[:limit])
+            block = block[limit:]
+        current = block
+
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+async def send_long_text(message: Message, text: str) -> None:
+    for chunk in split_text_chunks(text):
+        await message.answer(chunk)
+
+
+async def apply_tracking_stage_change(
+    message: Message,
+    bot: Bot,
+    tracking_code: str,
+    stage_key: str,
+) -> bool:
+    updated_user = set_tracking_stage(tracking_code, stage_key)
+    if not updated_user:
+        await message.answer("Р—Р°РєР°Р· СЃ С‚Р°РєРёРј РєРѕРґРѕРј РЅРµ РЅР°Р№РґРµРЅ.")
+        return False
+
+    username = f"@{updated_user['username']}" if updated_user.get("username") else "Р±РµР· username"
+    stage = TRACKING_STAGES[stage_key]
+    await message.answer(
+        f"Р­С‚Р°Рї РѕР±РЅРѕРІР»РµРЅ.\n"
+        f"РљРѕРґ: {tracking_code}\n"
+        f"Р’Р»Р°РґРµР»РµС†: {username}\n"
+        f"РќРѕРІС‹Р№ СЌС‚Р°Рї: {stage}"
+    )
+    try:
+        await bot.send_message(
+            updated_user["id"],
+            "РћР±РЅРѕРІР»РµРЅРёРµ РїРѕ Р·Р°РєР°Р·Сѓ.\n"
+            f"РўСЂРµРє-РєРѕРґ: {tracking_code}\n"
+            f"РќРѕРІС‹Р№ СЌС‚Р°Рї: {stage}"
+        )
+    except Exception:
+        pass
+    return True
+
+
+async def send_photo_or_text(
+    message: Message,
+    image_path: Path,
+    caption: str,
+    reply_markup: ReplyKeyboardMarkup | None = None,
+) -> None:
+    if image_path.exists():
+        await message.answer_photo(
+            photo=FSInputFile(str(image_path)),
+            caption=caption,
+            reply_markup=reply_markup,
+        )
+        return
+    await message.answer(caption, reply_markup=reply_markup)
+
+
+async def send_main_menu(message: Message, user_name: str) -> None:
+    await send_photo_or_text(
+        message,
+        WELCOME_IMAGE,
+        f"Привет, {user_name}! Это бот для заказа вещей из разных стран.\nВыбери нужный раздел в меню ниже:",
+        reply_markup=current_main_keyboard(message),
+    )
+
+
+async def notify_admin(bot: Bot, message: Message) -> None:
+    if not message.from_user or message.from_user.id == ADMIN_ID:
+        return
+
+    username = f"@{message.from_user.username}" if message.from_user.username else "Р±РµР· username"
+    text = message.text or message.caption or "[РЅРµ С‚РµРєСЃС‚РѕРІРѕРµ СЃРѕРѕР±С‰РµРЅРёРµ]"
+    await bot.send_message(
+        ADMIN_ID,
+        "РќРѕРІС‹Рµ РґР°РЅРЅС‹Рµ РїРѕ Р·Р°РєР°Р·Сѓ:\n\n"
+        f"ID: {message.from_user.id}\n"
+        f"РРјСЏ: {message.from_user.full_name}\n"
+        f"Username: {username}\n"
+        f"РўРµРєСЃС‚: {text}\n\n"
+        "Р§С‚РѕР±С‹ РѕС‚РІРµС‚РёС‚СЊ, РёСЃРїРѕР»СЊР·СѓР№:\n"
+        "/send user_id С‚РµРєСЃС‚\n"
+        "/done user_id",
+    )
+
+
+async def fetch_site_html(session: aiohttp.ClientSession, url: str) -> str:
+    try:
+        async with session.get(url, headers=HTTP_HEADERS, ssl=False) as response:
+            if response.status != 200:
+                return ""
+            return await response.text()
+    except Exception:
+        return ""
+
+
+def extract_matches_from_html(html: str, base_url: str, query: str) -> list[dict]:
+    if not html:
+        return []
+
+    tokens = tokenize_query(query)
+    if not tokens:
+        return []
+
+    soup = BeautifulSoup(html, "html.parser")
+    results: list[dict] = []
+    seen_urls: set[str] = set()
+
+    for link in soup.find_all("a", href=True):
+        title_parts = [
+            link.get_text(" ", strip=True),
+            link.get("title", ""),
+            link.get("aria-label", ""),
+            link.get("alt", ""),
+            link["href"],
+        ]
+        haystack = normalize_query(" ".join(part for part in title_parts if part))
+        if not haystack:
+            continue
+
+        token_matches = sum(1 for token in tokens if token in haystack)
+        if token_matches == 0:
+            continue
+
+        href = urljoin(base_url, link["href"])
+        if href in seen_urls:
+            continue
+
+        seen_urls.add(href)
+        title = link.get_text(" ", strip=True) or link.get("title") or href
+        results.append({"title": title, "url": href, "score": token_matches})
+
+    results.sort(key=lambda item: item["score"], reverse=True)
+    return results[:MAX_RESULTS]
+
+
+async def search_source(session: aiohttp.ClientSession, source_url: str, query: str) -> list[dict]:
+    html = await fetch_site_html(session, source_url)
+    return extract_matches_from_html(html, source_url, query)
+
+
+async def search_item_in_sources(query: str) -> list[dict]:
+    connector = aiohttp.TCPConnector(limit=12, limit_per_host=2, ssl=False)
+    async with search_semaphore:
+        async with aiohttp.ClientSession(timeout=REQUEST_TIMEOUT, connector=connector) as session:
+            batches = await asyncio.gather(
+                *(search_source(session, url, query) for url in SEARCH_SOURCES),
+                return_exceptions=False,
+            )
+
+    results = [item for batch in batches for item in batch]
+    results.sort(key=lambda item: item["score"], reverse=True)
+
+    unique: list[dict] = []
+    seen_urls: set[str] = set()
+    for result in results:
+        if result["url"] in seen_urls:
+            continue
+        seen_urls.add(result["url"])
+        unique.append(result)
+        if len(unique) >= MAX_RESULTS:
+            break
+    return unique
+
+
+@dp.message(Command("start"))
+async def cmd_start(message: Message) -> None:
+    if await maintenance_guard(message):
+        return
+    if is_rate_limited(message):
+        await maybe_send_rate_limit_notice(message)
+        return
+    update_user(message, status="Р—Р°РїСѓСЃС‚РёР» Р±РѕС‚Р°")
+    user_name = message.from_user.first_name if message.from_user else "РґСЂСѓРі"
+    await send_main_menu(message, user_name)
+
+
+@dp.message(Command("help"))
+async def cmd_help(message: Message) -> None:
+    if await maintenance_guard(message):
+        return
+    if is_rate_limited(message):
+        await maybe_send_rate_limit_notice(message)
+        return
+    update_user(message)
+    await message.answer(
+        "РљРѕРјР°РЅРґС‹:\n"
+        "/start - Р·Р°РїСѓСЃС‚РёС‚СЊ Р±РѕС‚Р°\n"
+        "/help - РїРѕРєР°Р·Р°С‚СЊ РїРѕРјРѕС‰СЊ\n"
+        "/track РљРћР” - РїРѕСЃРјРѕС‚СЂРµС‚СЊ СЃС‚Р°С‚СѓСЃ Р·Р°РєР°Р·Р°\n\n"
+        "Р”РѕСЃС‚СѓРїРЅС‹Рµ СЂР°Р·РґРµР»С‹:\n"
+        "- РЎРґРµР»Р°С‚СЊ Р·Р°РєР°Р·\n"
+        "- РўР°СЂРёС„С‹\n"
+        "- РРЅС„Рѕ\n"
+        "- РўРµС…. РїРѕРґРґРµСЂР¶РєР°\n\n"
+        "Р’ СЂР°Р·РґРµР»Рµ 'РРЅС„Рѕ' РјРѕР¶РЅРѕ Р±С‹СЃС‚СЂРѕ РїРѕСЃРјРѕС‚СЂРµС‚СЊ СЃРІРѕР№ Р·Р°РєР°Р· Рё РїРѕРїС‹С‚РєРё РїРѕРёСЃРєР°."
+    )
+
+
+@dp.message(Command("admin"))
+async def admin_panel(message: Message) -> None:
+    update_user(message)
+    if is_admin(message):
+        await message.answer(
+            "РђРґРјРёРЅ-РїР°РЅРµР»СЊ:\n\n"
+            f"РўРµС…РѕР±СЃР»СѓР¶РёРІР°РЅРёРµ: {'РІРєР»СЋС‡РµРЅРѕ' if is_maintenance_mode() else 'РІС‹РєР»СЋС‡РµРЅРѕ'}\n\n"
+            "/users - СЃРїРёСЃРѕРє РїРѕР»СЊР·РѕРІР°С‚РµР»РµР№\n"
+            "/orders - РІСЃРµ Р·Р°РєР°Р·С‹ Рё РёС… СЃС‚Р°С‚СѓСЃС‹\n"
+            "/active - С‚РѕР»СЊРєРѕ Р°РєС‚РёРІРЅС‹Рµ Р·Р°РєР°Р·С‹\n"
+            "/tracks - Р·Р°РєР°Р·С‹ СЃ С‚СЂРµРє-РєРѕРґР°РјРё\n"
+            "/orderno РЅРѕРјРµСЂ - РЅР°Р№С‚Рё Р·Р°РєР°Р· РїРѕ РЅРѕРјРµСЂСѓ\n"
+            "/today - РєРѕСЂРѕС‚РєР°СЏ СЃРІРѕРґРєР° Р·Р° СЃРµРіРѕРґРЅСЏ\n"
+            "/recent - РїРѕСЃР»РµРґРЅРёРµ 10 РїРѕР»СЊР·РѕРІР°С‚РµР»РµР№\n"
+            "/search Р·Р°РїСЂРѕСЃ - РїРѕРёСЃРє РїРѕ РїРѕР»СЊР·РѕРІР°С‚РµР»СЏРј Рё Р·Р°РєР°Р·Р°Рј\n"
+            "/grantsearch user_id [РєРѕР»-РІРѕ] - РІС‹РґР°С‚СЊ РїРѕРїС‹С‚РєРё РїРѕРёСЃРєР°\n"
+            "/setsearch user_id РєРѕР»-РІРѕ - РІС‹СЃС‚Р°РІРёС‚СЊ С‚РѕС‡РЅРѕРµ С‡РёСЃР»Рѕ РїРѕРїС‹С‚РѕРє\n"
+            "/revokesearch user_id - СѓРґР°Р»РёС‚СЊ РІСЃРµ РїРѕРїС‹С‚РєРё РїРѕРёСЃРєР°\n"
+            "/searchlist - Сѓ РєРѕРіРѕ РµСЃС‚СЊ РїРѕРїС‹С‚РєРё РїРѕРёСЃРєР°\n"
+            "/user user_id - РєР°СЂС‚РѕС‡РєР° РїРѕР»СЊР·РѕРІР°С‚РµР»СЏ\n"
+            "/owner РєРѕРґ - СѓР·РЅР°С‚СЊ РІР»Р°РґРµР»СЊС†Р° С‚СЂРµРє-РєРѕРґР°\n"
+            "/status user_id С‚РµРєСЃС‚ - РІСЂСѓС‡РЅСѓСЋ СЃРјРµРЅРёС‚СЊ СЃС‚Р°С‚СѓСЃ\n"
+            "/stats - СЃС‚Р°С‚РёСЃС‚РёРєР° РїРѕ Р±РѕС‚Сѓ\n"
+            "/note user_id С‚РµРєСЃС‚ - Р·Р°РјРµС‚РєР° РїРѕ РїРѕР»СЊР·РѕРІР°С‚РµР»СЋ\n"
+            "/clearnote user_id - РѕС‡РёСЃС‚РёС‚СЊ Р·Р°РјРµС‚РєСѓ\n"
+            "/send user_id С‚РµРєСЃС‚ - РѕС‚РїСЂР°РІРёС‚СЊ СЃРѕРѕР±С‰РµРЅРёРµ РїРѕР»СЊР·РѕРІР°С‚РµР»СЋ\n"
+            "/broadcast С‚РµРєСЃС‚ - РѕС‚РїСЂР°РІРёС‚СЊ СЃРѕРѕР±С‰РµРЅРёРµ РІСЃРµРј РїРѕР»СЊР·РѕРІР°С‚РµР»СЏРј\n"
+            "/maintenance on|off - РІРєР»СЋС‡РёС‚СЊ РёР»Рё РІС‹РєР»СЋС‡РёС‚СЊ С‚РµС…РѕР±СЃР»СѓР¶РёРІР°РЅРёРµ\n"
+            "/setyuan 12,0 - РёР·РјРµРЅРёС‚СЊ РєСѓСЂСЃ СЋР°РЅСЏ\n"
+            "/done user_id - РѕР±СЂР°Р±РѕС‚Р°С‚СЊ Р·Р°РєР°Р· Рё РІС‹РґР°С‚СЊ С‚СЂРµРє-РєРѕРґ\n"
+            "/cancel user_id - РѕС‚РјРµРЅРёС‚СЊ Р·Р°РєР°Р· РєР»РёРµРЅС‚Р°\n"
+            "/track РєРѕРґ - РїРѕСЃРјРѕС‚СЂРµС‚СЊ СЌС‚Р°Рї Р·Р°РєР°Р·Р°\n"
+            "/trackset РєРѕРґ СЌС‚Р°Рї - РёР·РјРµРЅРёС‚СЊ СЌС‚Р°Рї Р·Р°РєР°Р·Р°\n"
+            "/vykup РєРѕРґ - Р±С‹СЃС‚СЂРѕ РїРѕСЃС‚Р°РІРёС‚СЊ СЌС‚Р°Рї 'Р’С‹РєСѓРїР»РµРЅ'\n"
+            "/sklad РєРѕРґ - Р±С‹СЃС‚СЂРѕ РїРѕСЃС‚Р°РІРёС‚СЊ СЌС‚Р°Рї 'РџСЂРёРµС…Р°Р» РЅР° СЃРєР»Р°Рґ'\n"
+            "/otpravlen РєРѕРґ - Р±С‹СЃС‚СЂРѕ РїРѕСЃС‚Р°РІРёС‚СЊ СЌС‚Р°Рї 'РћС‚РїСЂР°РІР»РµРЅ'\n"
+            "/rf РєРѕРґ - Р±С‹СЃС‚СЂРѕ РїРѕСЃС‚Р°РІРёС‚СЊ СЌС‚Р°Рї 'РџСЂРёРµС…Р°Р» РІ Р Р¤'\n"
+            "/find С‚РµРєСЃС‚ - РїРѕРёСЃРє РІРµС‰Рё РїРѕ С‚РІРѕРёРј СЃСЃС‹Р»РєР°Рј\n"
+            "/excelsend [РЅРѕРјРµСЂ|РёРјСЏ|current] - РѕС‚РїСЂР°РІРёС‚СЊ С‚Р°Р±Р»РёС†Сѓ С„Р°Р№Р»РѕРј\n"
+            "/excelview [РЅРѕРјРµСЂ|РёРјСЏ|current] - РїРѕРєР°Р·Р°С‚СЊ СЃРѕРґРµСЂР¶РёРјРѕРµ С‚Р°Р±Р»РёС†С‹\n"
+            "/exceldelete [РЅРѕРјРµСЂ|РёРјСЏ|current] - СѓРґР°Р»РёС‚СЊ С‚Р°Р±Р»РёС†Сѓ\n"
+            "/exceledit [РЅРѕРјРµСЂ|РёРјСЏ|current] СЃС‚СЂРѕРєР° РїРѕР»Рµ Р·РЅР°С‡РµРЅРёРµ - РёР·РјРµРЅРёС‚СЊ СЃС‚СЂРѕРєСѓ С‚Р°Р±Р»РёС†С‹\n"
+            "/admin - РїРѕРєР°Р·Р°С‚СЊ РІСЃРµ Р°РґРјРёРЅ-РєРѕРјР°РЅРґС‹"
+        )
+        return
+    if not is_admin(message):
+        await message.answer("РЈ С‚РµР±СЏ РЅРµС‚ РґРѕСЃС‚СѓРїР° Рє Р°РґРјРёРЅ-РїР°РЅРµР»Рё.")
+        return
+
+    maintenance_status = "РІРєР»СЋС‡РµРЅРѕ" if is_maintenance_mode() else "РІС‹РєР»СЋС‡РµРЅРѕ"
+    await message.answer(
+        "РђРґРјРёРЅ-РїР°РЅРµР»СЊ:\n\n"
+        f"РўРµС…РѕР±СЃР»СѓР¶РёРІР°РЅРёРµ: {maintenance_status}\n\n"
+        "/users - СЃРїРёСЃРѕРє РїРѕР»СЊР·РѕРІР°С‚РµР»РµР№\n"
+        "/orders - РІСЃРµ Р·Р°РєР°Р·С‹ Рё РёС… СЃС‚Р°С‚СѓСЃС‹\n"
+        "/active - С‚РѕР»СЊРєРѕ Р°РєС‚РёРІРЅС‹Рµ Р·Р°РєР°Р·С‹\n"
+        "/tracks - Р·Р°РєР°Р·С‹ СЃ С‚СЂРµРє-РєРѕРґР°РјРё\n"
+        "/orderno РЅРѕРјРµСЂ - РЅР°Р№С‚Рё Р·Р°РєР°Р· РїРѕ РЅРѕРјРµСЂСѓ\n"
+        "/today - РєРѕСЂРѕС‚РєР°СЏ СЃРІРѕРґРєР° Р·Р° СЃРµРіРѕРґРЅСЏ\n"
+        "/recent - РїРѕСЃР»РµРґРЅРёРµ 10 РїРѕР»СЊР·РѕРІР°С‚РµР»РµР№\n"
+        "/search Р·Р°РїСЂРѕСЃ - РїРѕРёСЃРє РїРѕ РїРѕР»СЊР·РѕРІР°С‚РµР»СЏРј Рё Р·Р°РєР°Р·Р°Рј\n"
+        "/grantsearch user_id [РєРѕР»-РІРѕ] - РІС‹РґР°С‚СЊ РїРѕРїС‹С‚РєРё РїРѕРёСЃРєР°\n"
+        "/setsearch user_id РєРѕР»-РІРѕ - РІС‹СЃС‚Р°РІРёС‚СЊ С‚РѕС‡РЅРѕРµ С‡РёСЃР»Рѕ РїРѕРїС‹С‚РѕРє\n"
+        "/revokesearch user_id - СѓРґР°Р»РёС‚СЊ РІСЃРµ РїРѕРїС‹С‚РєРё РїРѕРёСЃРєР°\n"
+        "/searchlist - Сѓ РєРѕРіРѕ РµСЃС‚СЊ РїРѕРїС‹С‚РєРё РїРѕРёСЃРєР°\n"
+        "/user user_id - РєР°СЂС‚РѕС‡РєР° РїРѕР»СЊР·РѕРІР°С‚РµР»СЏ\n"
+        "/owner РєРѕРґ - СѓР·РЅР°С‚СЊ РІР»Р°РґРµР»СЊС†Р° С‚СЂРµРє-РєРѕРґР°\n"
+        "/status user_id С‚РµРєСЃС‚ - РІСЂСѓС‡РЅСѓСЋ СЃРјРµРЅРёС‚СЊ СЃС‚Р°С‚СѓСЃ\n"
+        "/stats - СЃС‚Р°С‚РёСЃС‚РёРєР° РїРѕ Р±РѕС‚Сѓ\n"
+        "/note user_id С‚РµРєСЃС‚ - Р·Р°РјРµС‚РєР° РїРѕ РїРѕР»СЊР·РѕРІР°С‚РµР»СЋ\n"
+        "/clearnote user_id - РѕС‡РёСЃС‚РёС‚СЊ Р·Р°РјРµС‚РєСѓ\n"
+        "/send user_id С‚РµРєСЃС‚ - РѕС‚РїСЂР°РІРёС‚СЊ СЃРѕРѕР±С‰РµРЅРёРµ РїРѕР»СЊР·РѕРІР°С‚РµР»СЋ\n"
+        "/broadcast С‚РµРєСЃС‚ - РѕС‚РїСЂР°РІРёС‚СЊ СЃРѕРѕР±С‰РµРЅРёРµ РІСЃРµРј РїРѕР»СЊР·РѕРІР°С‚РµР»СЏРј\n"
+        "/maintenance on|off - РІРєР»СЋС‡РёС‚СЊ РёР»Рё РІС‹РєР»СЋС‡РёС‚СЊ С‚РµС…РѕР±СЃР»СѓР¶РёРІР°РЅРёРµ\n"
+        "/done user_id - РѕР±СЂР°Р±РѕС‚Р°С‚СЊ Р·Р°РєР°Р· Рё РІС‹РґР°С‚СЊ С‚СЂРµРє-РєРѕРґ\n"
+        "/cancel user_id - РѕС‚РјРµРЅРёС‚СЊ Р·Р°РєР°Р· РєР»РёРµРЅС‚Р°\n"
+        "/track РєРѕРґ - РїРѕСЃРјРѕС‚СЂРµС‚СЊ СЌС‚Р°Рї Р·Р°РєР°Р·Р°\n"
+        "/trackset РєРѕРґ СЌС‚Р°Рї - РёР·РјРµРЅРёС‚СЊ СЌС‚Р°Рї Р·Р°РєР°Р·Р°\n"
+        "/vykup РєРѕРґ - Р±С‹СЃС‚СЂРѕ РїРѕСЃС‚Р°РІРёС‚СЊ СЌС‚Р°Рї 'Р’С‹РєСѓРїР»РµРЅ'\n"
+        "/sklad РєРѕРґ - Р±С‹СЃС‚СЂРѕ РїРѕСЃС‚Р°РІРёС‚СЊ СЌС‚Р°Рї 'РџСЂРёРµС…Р°Р» РЅР° СЃРєР»Р°Рґ'\n"
+        "/otpravlen РєРѕРґ - Р±С‹СЃС‚СЂРѕ РїРѕСЃС‚Р°РІРёС‚СЊ СЌС‚Р°Рї 'РћС‚РїСЂР°РІР»РµРЅ'\n"
+        "/rf РєРѕРґ - Р±С‹СЃС‚СЂРѕ РїРѕСЃС‚Р°РІРёС‚СЊ СЌС‚Р°Рї 'РџСЂРёРµС…Р°Р» РІ Р Р¤'\n"
+        "/find С‚РµРєСЃС‚ - РїРѕРёСЃРє РІРµС‰Рё РїРѕ С‚РІРѕРёРј СЃСЃС‹Р»РєР°Рј\n\n"
+        "РџРѕРёСЃРє РґР»СЏ РєР»РёРµРЅС‚РѕРІ:\n"
+        "РџРѕРёСЃРє РїРѕ С„РѕС‚Рѕ РґРѕСЃС‚СѓРїРµРЅ С‚РѕР»СЊРєРѕ Р°РґРјРёРЅСѓ.\n"
+        "РћР±С‹С‡РЅС‹Рј РїРѕР»СЊР·РѕРІР°С‚РµР»СЏРј РјРѕР¶РЅРѕ РІС‹РґР°С‚СЊ РїР»Р°С‚РЅС‹Рµ РїРѕРїС‹С‚РєРё РїРѕРёСЃРєР° РїРѕ РЅР°Р·РІР°РЅРёСЋ.\n\n"
+        "Р­С‚Р°РїС‹ РґРѕСЃС‚Р°РІРєРё:\n"
+        "1 - Р’С‹РєСѓРїР»РµРЅ\n"
+        "2 - РџСЂРёРµС…Р°Р» РЅР° СЃРєР»Р°Рґ\n"
+        "3 - РћС‚РїСЂР°РІР»РµРЅ\n"
+        "4 - РџСЂРёРµС…Р°Р» РІ Р Р¤"
+    )
+
+
+@dp.message(Command("stats"))
+async def admin_stats(message: Message) -> None:
+    if not is_admin(message):
+        await message.answer("РЈ С‚РµР±СЏ РЅРµС‚ РґРѕСЃС‚СѓРїР° Рє СЌС‚РѕР№ РєРѕРјР°РЅРґРµ.")
+        return
+
+    users = load_users()
+    total = len(users)
+    orders = sum(1 for user in users.values() if user.get("order_number", 0))
+    china = sum(1 for user in users.values() if user.get("country") == "РљРёС‚Р°Р№")
+    sent = sum(1 for user in users.values() if user.get("status") == "Р—Р°СЏРІРєР° РѕС‚РїСЂР°РІР»РµРЅР°")
+    pending = sum(1 for user in users.values() if user.get("status") == "РћС‚РїСЂР°РІР»СЏРµС‚ РґР°РЅРЅС‹Рµ")
+    processed = sum(1 for user in users.values() if user.get("status") == "Р—Р°РєР°Р· РѕР±СЂР°Р±РѕС‚Р°РЅ")
+    with_codes = sum(1 for user in users.values() if user.get("tracking_code"))
+    paid_search = sum(1 for user in users.values() if int(user.get("search_access", 0) or 0) > 0)
+    total_search_credits = sum(int(user.get("search_access", 0) or 0) for user in users.values())
+    in_russia = sum(1 for user in users.values() if user.get("tracking_stage") == TRACKING_STAGES["4"])
+
+    await message.answer(
+        "РЎС‚Р°С‚РёСЃС‚РёРєР°:\n\n"
+        f"Р’СЃРµРіРѕ РїРѕР»СЊР·РѕРІР°С‚РµР»РµР№: {total}\n"
+        f"Р’СЃРµРіРѕ Р·Р°РєР°Р·РѕРІ: {orders}\n"
+        f"РљРёС‚Р°Р№: {china}\n"
+        f"РћС‚РїСЂР°РІР»СЏСЋС‚ РґР°РЅРЅС‹Рµ: {pending}\n"
+        f"Р—Р°СЏРІРєР° РѕС‚РїСЂР°РІР»РµРЅР°: {sent}\n"
+        f"Р—Р°РєР°Р· РѕР±СЂР°Р±РѕС‚Р°РЅ: {processed}\n"
+        f"РЎ С‚СЂРµРє-РєРѕРґРѕРј: {with_codes}\n"
+        f"РџРѕР»СЊР·РѕРІР°С‚РµР»РµР№ СЃ РїРѕРёСЃРєРѕРј: {paid_search}\n"
+        f"Р’СЃРµРіРѕ РїРѕРїС‹С‚РѕРє РїРѕРёСЃРєР°: {total_search_credits}\n"
+        f"РџСЂРёРµС…Р°Р»Рё РІ Р Р¤: {in_russia}"
+    )
+
+
+@dp.message(Command("maintenance"))
+async def admin_maintenance(message: Message) -> None:
+    if not is_admin(message):
+        await message.answer("РЈ С‚РµР±СЏ РЅРµС‚ РґРѕСЃС‚СѓРїР° Рє СЌС‚РѕР№ РєРѕРјР°РЅРґРµ.")
+        return
+
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        status = "РІРєР»СЋС‡РµРЅРѕ" if is_maintenance_mode() else "РІС‹РєР»СЋС‡РµРЅРѕ"
+        await message.answer(
+            "РСЃРїРѕР»СЊР·СѓР№ С„РѕСЂРјР°С‚: /maintenance on|off\n"
+            f"РЎРµР№С‡Р°СЃ С‚РµС…РѕР±СЃР»СѓР¶РёРІР°РЅРёРµ: {status}"
+        )
+        return
+
+    mode = parts[1].strip().lower()
+    if mode not in {"on", "off"}:
+        await message.answer("РСЃРїРѕР»СЊР·СѓР№ С„РѕСЂРјР°С‚: /maintenance on|off")
+        return
+
+    enabled = mode == "on"
+    set_maintenance_mode(enabled)
+    await message.answer(
+        "РўРµС…РѕР±СЃР»СѓР¶РёРІР°РЅРёРµ РІРєР»СЋС‡РµРЅРѕ. РўРµРїРµСЂСЊ Р±РѕС‚ РѕС‚РІРµС‡Р°РµС‚ С‚РѕР»СЊРєРѕ Р°РґРјРёРЅСѓ."
+        if enabled
+        else "РўРµС…РѕР±СЃР»СѓР¶РёРІР°РЅРёРµ РІС‹РєР»СЋС‡РµРЅРѕ. Р‘РѕС‚ СЃРЅРѕРІР° РѕС‚РІРµС‡Р°РµС‚ РІСЃРµРј РїРѕР»СЊР·РѕРІР°С‚РµР»СЏРј."
+    )
+
+
+@dp.message(Command("broadcast"))
+async def admin_broadcast(message: Message, bot: Bot) -> None:
+    if not is_admin(message):
+        await message.answer("РЈ С‚РµР±СЏ РЅРµС‚ РґРѕСЃС‚СѓРїР° Рє СЌС‚РѕР№ РєРѕРјР°РЅРґРµ.")
+        return
+
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        await message.answer("РСЃРїРѕР»СЊР·СѓР№ С„РѕСЂРјР°С‚: /broadcast С‚РµРєСЃС‚")
+        return
+
+    users = load_users()
+    recipients = [
+        user["id"]
+        for user in users.values()
+        if int(user.get("id", 0) or 0) != ADMIN_ID
+    ]
+    if not recipients:
+        await message.answer("РќРµС‚ РїРѕР»СЊР·РѕРІР°С‚РµР»РµР№ РґР»СЏ СЂР°СЃСЃС‹Р»РєРё.")
+        return
+
+    text = parts[1].strip()
+    sent = 0
+    failed = 0
+
+    await message.answer(f"РќР°С‡РёРЅР°СЋ СЂР°СЃСЃС‹Р»РєСѓ. РџРѕР»СѓС‡Р°С‚РµР»РµР№: {len(recipients)}")
+    for user_id in recipients:
+        try:
+            await bot.send_message(user_id, text)
+            sent += 1
+        except Exception:
+            failed += 1
+
+    await message.answer(
+        "Р Р°СЃСЃС‹Р»РєР° Р·Р°РІРµСЂС€РµРЅР°.\n"
+        f"РћС‚РїСЂР°РІР»РµРЅРѕ: {sent}\n"
+        f"РќРµ РґРѕСЃС‚Р°РІР»РµРЅРѕ: {failed}"
+    )
+
+
+@dp.message(Command("pending"))
+async def pending_orders(message: Message) -> None:
+    if not is_admin(message):
+        await message.answer("РЈ С‚РµР±СЏ РЅРµС‚ РґРѕСЃС‚СѓРїР° Рє СЌС‚РѕР№ РєРѕРјР°РЅРґРµ.")
+        return
+
+    pending = get_pending_orders()
+    if not pending:
+        await message.answer("РќРµРѕРґРѕР±СЂРµРЅРЅС‹С… Р·Р°РєР°Р·РѕРІ СЃРµР№С‡Р°СЃ РЅРµС‚.")
+        return
+
+    lines = [format_order_card(user, include_action_hint=True) for user in pending]
+    await send_long_text(message, "РќРµРѕРґРѕР±СЂРµРЅРЅС‹Рµ Р·Р°РєР°Р·С‹:\n\n" + "\n\n".join(lines))
+
+
+@dp.message(Command("orders"))
+async def all_orders(message: Message) -> None:
+    if not is_admin(message):
+        await message.answer("РЈ С‚РµР±СЏ РЅРµС‚ РґРѕСЃС‚СѓРїР° Рє СЌС‚РѕР№ РєРѕРјР°РЅРґРµ.")
+        return
+
+    orders = get_all_orders()
+    if not orders:
+        await message.answer("Р—Р°РєР°Р·РѕРІ РїРѕРєР° РЅРµС‚.")
+        return
+
+    lines = [format_order_card(user, include_action_hint=True) for user in orders]
+    await send_long_text(message, "Р’СЃРµ Р·Р°РєР°Р·С‹ Рё РёС… СЃС‚Р°С‚СѓСЃС‹:\n\n" + "\n\n".join(lines))
+
+
+@dp.message(Command("active"))
+async def active_orders(message: Message) -> None:
+    if not is_admin(message):
+        await message.answer("РЈ С‚РµР±СЏ РЅРµС‚ РґРѕСЃС‚СѓРїР° Рє СЌС‚РѕР№ РєРѕРјР°РЅРґРµ.")
+        return
+
+    orders = get_active_orders()
+    if not orders:
+        await message.answer("РђРєС‚РёРІРЅС‹С… Р·Р°РєР°Р·РѕРІ СЃРµР№С‡Р°СЃ РЅРµС‚.")
+        return
+
+    lines = [format_order_card(user, include_action_hint=True) for user in orders]
+    await send_long_text(message, "РђРєС‚РёРІРЅС‹Рµ Р·Р°РєР°Р·С‹:\n\n" + "\n\n".join(lines))
+
+
+@dp.message(Command("tracks"))
+async def tracked_orders(message: Message) -> None:
+    if not is_admin(message):
+        await message.answer("РЈ С‚РµР±СЏ РЅРµС‚ РґРѕСЃС‚СѓРїР° Рє СЌС‚РѕР№ РєРѕРјР°РЅРґРµ.")
+        return
+
+    orders = get_tracked_orders()
+    if not orders:
+        await message.answer("Р—Р°РєР°Р·РѕРІ СЃ С‚СЂРµРє-РєРѕРґР°РјРё РїРѕРєР° РЅРµС‚.")
+        return
+
+    lines = [format_order_card(user) for user in orders]
+    await send_long_text(message, "Р—Р°РєР°Р·С‹ СЃ С‚СЂРµРє-РєРѕРґР°РјРё:\n\n" + "\n\n".join(lines))
+
+
+@dp.message(Command("orderno"))
+async def order_by_number(message: Message) -> None:
+    if not is_admin(message):
+        await message.answer("РЈ С‚РµР±СЏ РЅРµС‚ РґРѕСЃС‚СѓРїР° Рє СЌС‚РѕР№ РєРѕРјР°РЅРґРµ.")
+        return
+
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer("РСЃРїРѕР»СЊР·СѓР№ С„РѕСЂРјР°С‚: /orderno РЅРѕРјРµСЂ")
+        return
+
+    try:
+        order_number = int(parts[1].strip())
+    except ValueError:
+        await message.answer("РќРѕРјРµСЂ Р·Р°РєР°Р·Р° РґРѕР»Р¶РµРЅ Р±С‹С‚СЊ С‡РёСЃР»РѕРј.")
+        return
+
+    user = get_user_by_order_number(order_number)
+    if not user:
+        await message.answer("Р—Р°РєР°Р· СЃ С‚Р°РєРёРј РЅРѕРјРµСЂРѕРј РЅРµ РЅР°Р№РґРµРЅ.")
+        return
+
+    await message.answer("Р—Р°РєР°Р· РЅР°Р№РґРµРЅ:\n\n" + format_order_card(user, include_action_hint=True))
+
+
+@dp.message(Command("today"))
+async def today_summary(message: Message) -> None:
+    if not is_admin(message):
+        await message.answer("РЈ С‚РµР±СЏ РЅРµС‚ РґРѕСЃС‚СѓРїР° Рє СЌС‚РѕР№ РєРѕРјР°РЅРґРµ.")
+        return
+
+    stats = get_today_stats()
+    await message.answer(
+        "РЎРµРіРѕРґРЅСЏ:\n\n"
+        f"РќРѕРІС‹С… РїРѕР»СЊР·РѕРІР°С‚РµР»РµР№: {stats['new_users']}\n"
+        f"РђРєС‚РёРІРЅС‹С… СЃРµРіРѕРґРЅСЏ: {stats['active_today']}\n"
+        f"Р—Р°РєР°Р·РѕРІ РѕР±РЅРѕРІР»СЏР»РѕСЃСЊ СЃРµРіРѕРґРЅСЏ: {stats['orders_today']}\n"
+        f"РћР±СЂР°Р±РѕС‚Р°РЅРѕ СЃРµРіРѕРґРЅСЏ: {stats['processed_today']}"
+    )
+
+
+@dp.message(Command("recent"))
+async def recent_users(message: Message) -> None:
+    if not is_admin(message):
+        await message.answer("РЈ С‚РµР±СЏ РЅРµС‚ РґРѕСЃС‚СѓРїР° Рє СЌС‚РѕР№ РєРѕРјР°РЅРґРµ.")
+        return
+
+    recent = get_recent_users()
+    if not recent:
+        await message.answer("РџРѕРєР° РЅРµС‚ РїРѕР»СЊР·РѕРІР°С‚РµР»РµР№.")
+        return
+
+    lines = [format_order_card(user) for user in recent]
+    await send_long_text(message, "РџРѕСЃР»РµРґРЅРёРµ 10 РїРѕР»СЊР·РѕРІР°С‚РµР»РµР№:\n\n" + "\n\n".join(lines))
+
+
+@dp.message(Command("search"))
+async def admin_search_command(message: Message) -> None:
+    if not is_admin(message):
+        await message.answer("РЈ С‚РµР±СЏ РЅРµС‚ РґРѕСЃС‚СѓРїР° Рє СЌС‚РѕР№ РєРѕРјР°РЅРґРµ.")
+        return
+
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        await message.answer("РСЃРїРѕР»СЊР·СѓР№ С„РѕСЂРјР°С‚: /search Р·Р°РїСЂРѕСЃ")
+        return
+
+    results = search_users(parts[1].strip())
+    if not results:
+        await message.answer("РќРёС‡РµРіРѕ РЅРµ РЅР°Р№РґРµРЅРѕ.")
+        return
+
+    lines = [format_order_card(user) for user in results]
+    await send_long_text(message, "Р РµР·СѓР»СЊС‚Р°С‚С‹ РїРѕРёСЃРєР°:\n\n" + "\n\n".join(lines))
+
+
+@dp.message(Command("grantsearch"))
+async def admin_grant_search(message: Message, bot: Bot) -> None:
+    if not is_admin(message):
+        await message.answer("РЈ С‚РµР±СЏ РЅРµС‚ РґРѕСЃС‚СѓРїР° Рє СЌС‚РѕР№ РєРѕРјР°РЅРґРµ.")
+        return
+
+    parts = (message.text or "").split(maxsplit=2)
+    if len(parts) < 2:
+        await message.answer("РСЃРїРѕР»СЊР·СѓР№ С„РѕСЂРјР°С‚: /grantsearch user_id [РєРѕР»-РІРѕ]")
+        return
+
+    try:
+        user_id = int(parts[1].strip())
+    except ValueError:
+        await message.answer("user_id РґРѕР»Р¶РµРЅ Р±С‹С‚СЊ С‡РёСЃР»РѕРј.")
+        return
+
+    amount = 1
+    if len(parts) >= 3 and parts[2].strip():
+        try:
+            amount = int(parts[2].strip())
+        except ValueError:
+            await message.answer("РљРѕР»РёС‡РµСЃС‚РІРѕ РґРѕР»Р¶РЅРѕ Р±С‹С‚СЊ С‡РёСЃР»РѕРј.")
+            return
+    if amount <= 0:
+        await message.answer("РљРѕР»РёС‡РµСЃС‚РІРѕ РїРѕРїС‹С‚РѕРє РґРѕР»Р¶РЅРѕ Р±С‹С‚СЊ Р±РѕР»СЊС€Рµ РЅСѓР»СЏ.")
+        return
+
+    total_credits = add_search_credits(user_id, amount)
+    if total_credits is None:
+        await message.answer("РџРѕР»СЊР·РѕРІР°С‚РµР»СЊ РЅРµ РЅР°Р№РґРµРЅ. РЎРЅР°С‡Р°Р»Р° РѕРЅ РґРѕР»Р¶РµРЅ РЅР°РїРёСЃР°С‚СЊ Р±РѕС‚Сѓ.")
+        return
+
+    try:
+        await bot.send_message(
+            user_id,
+            "РўРµР±Рµ РѕС‚РєСЂС‹С‚ РґРѕСЃС‚СѓРї Рє РїР»Р°С‚РЅРѕРјСѓ РїРѕРёСЃРєСѓ РІРµС‰Рё РІ РљРёС‚Р°Рµ.\n"
+            f"Р’С‹РґР°РЅРѕ РїРѕРїС‹С‚РѕРє: {amount}\n"
+            f"Р’СЃРµРіРѕ РїРѕРїС‹С‚РѕРє РѕСЃС‚Р°Р»РѕСЃСЊ: {total_credits}\n"
+            "РўРµРїРµСЂСЊ РјРѕР¶РЅРѕ Р·Р°Р№С‚Рё РІ 'РЎРґРµР»Р°С‚СЊ Р·Р°РєР°Р·' -> 'РќР°Р№С‚Рё СЌС‚Сѓ РІРµС‰СЊ РІ РљРёС‚Р°Рµ'.\n"
+            "РџРѕРёСЃРє РїРѕ С„РѕС‚Рѕ РґРѕСЃС‚СѓРїРµРЅ С‚РѕР»СЊРєРѕ Р°РґРјРёРЅСѓ, С‚РµР±Рµ РґРѕСЃС‚СѓРїРµРЅ РїРѕРёСЃРє РїРѕ РЅР°Р·РІР°РЅРёСЋ РІРµС‰Рё."
+        )
+    except Exception:
+        pass
+
+    await message.answer(
+        f"РџРѕР»СЊР·РѕРІР°С‚РµР»СЋ {user_id} РІС‹РґР°РЅРѕ РїРѕРїС‹С‚РѕРє: {amount}\n"
+        f"Р’СЃРµРіРѕ РїРѕРїС‹С‚РѕРє Сѓ РЅРµРіРѕ: {total_credits}"
+    )
+
+
+@dp.message(Command("setsearch"))
+async def admin_set_search(message: Message, bot: Bot) -> None:
+    if not is_admin(message):
+        await message.answer("РЈ С‚РµР±СЏ РЅРµС‚ РґРѕСЃС‚СѓРїР° Рє СЌС‚РѕР№ РєРѕРјР°РЅРґРµ.")
+        return
+
+    parts = (message.text or "").split(maxsplit=2)
+    if len(parts) < 3:
+        await message.answer("РСЃРїРѕР»СЊР·СѓР№ С„РѕСЂРјР°С‚: /setsearch user_id РєРѕР»-РІРѕ")
+        return
+
+    try:
+        user_id = int(parts[1].strip())
+        amount = int(parts[2].strip())
+    except ValueError:
+        await message.answer("user_id Рё РєРѕР»РёС‡РµСЃС‚РІРѕ РґРѕР»Р¶РЅС‹ Р±С‹С‚СЊ С‡РёСЃР»Р°РјРё.")
+        return
+
+    if amount < 0:
+        await message.answer("РљРѕР»РёС‡РµСЃС‚РІРѕ РїРѕРїС‹С‚РѕРє РЅРµ РјРѕР¶РµС‚ Р±С‹С‚СЊ РѕС‚СЂРёС†Р°С‚РµР»СЊРЅС‹Рј.")
+        return
+
+    remaining = set_search_credits(user_id, amount)
+    if remaining is None:
+        await message.answer("РџРѕР»СЊР·РѕРІР°С‚РµР»СЊ РЅРµ РЅР°Р№РґРµРЅ. РЎРЅР°С‡Р°Р»Р° РѕРЅ РґРѕР»Р¶РµРЅ РЅР°РїРёСЃР°С‚СЊ Р±РѕС‚Сѓ.")
+        return
+
+    if remaining <= 0:
+        paid_search_users.discard(user_id)
+
+    try:
+        await bot.send_message(
+            user_id,
+            "РћР±РЅРѕРІР»РµРЅ РґРѕСЃС‚СѓРї Рє РїРѕРёСЃРєСѓ РІРµС‰Рё РІ РљРёС‚Р°Рµ.\n"
+            f"РЎРµР№С‡Р°СЃ РїРѕРїС‹С‚РѕРє РїРѕРёСЃРєР°: {remaining}"
+        )
+    except Exception:
+        pass
+
+    await message.answer(f"РџРѕР»СЊР·РѕРІР°С‚РµР»СЋ {user_id} РІС‹СЃС‚Р°РІР»РµРЅРѕ РїРѕРїС‹С‚РѕРє РїРѕРёСЃРєР°: {remaining}")
+
+
+@dp.message(Command("revokesearch"))
+async def admin_revoke_search(message: Message, bot: Bot) -> None:
+    if not is_admin(message):
+        await message.answer("РЈ С‚РµР±СЏ РЅРµС‚ РґРѕСЃС‚СѓРїР° Рє СЌС‚РѕР№ РєРѕРјР°РЅРґРµ.")
+        return
+
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer("РСЃРїРѕР»СЊР·СѓР№ С„РѕСЂРјР°С‚: /revokesearch user_id")
+        return
+
+    try:
+        user_id = int(parts[1].strip())
+    except ValueError:
+        await message.answer("user_id РґРѕР»Р¶РµРЅ Р±С‹С‚СЊ С‡РёСЃР»РѕРј.")
+        return
+
+    remaining = set_search_credits(user_id, 0)
+    if remaining is None:
+        await message.answer("РџРѕР»СЊР·РѕРІР°С‚РµР»СЊ РЅРµ РЅР°Р№РґРµРЅ.")
+        return
+
+    paid_search_users.discard(user_id)
+    try:
+        await bot.send_message(
+            user_id,
+            "Р’СЃРµ РїРѕРїС‹С‚РєРё РїРѕРёСЃРєР° РІРµС‰Рё РІ РљРёС‚Р°Рµ Р±С‹Р»Рё СѓРґР°Р»РµРЅС‹."
+        )
+    except Exception:
+        pass
+
+    await message.answer(f"Р’СЃРµ РїРѕРїС‹С‚РєРё РїРѕРёСЃРєР° СѓРґР°Р»РµРЅС‹ Сѓ РїРѕР»СЊР·РѕРІР°С‚РµР»СЏ {user_id}.")
+
+
+@dp.message(Command("searchlist"))
+async def admin_search_list(message: Message) -> None:
+    if not is_admin(message):
+        await message.answer("РЈ С‚РµР±СЏ РЅРµС‚ РґРѕСЃС‚СѓРїР° Рє СЌС‚РѕР№ РєРѕРјР°РЅРґРµ.")
+        return
+
+    users = get_search_access_users()
+    if not users:
+        await message.answer("РЎРµР№С‡Р°СЃ РЅРё Сѓ РєРѕРіРѕ РЅРµС‚ РґРѕСЃС‚СѓРїР° Рє РїР»Р°С‚РЅРѕРјСѓ РїРѕРёСЃРєСѓ.")
+        return
+
+    lines = [format_order_card(user) for user in users]
+    await send_long_text(message, "РџР»Р°С‚РЅС‹Рµ РїРѕРїС‹С‚РєРё РїРѕРёСЃРєР° РµСЃС‚СЊ Сѓ:\n\n" + "\n\n".join(lines))
+
+
+@dp.message(Command("user"))
+async def admin_user_card(message: Message) -> None:
+    if not is_admin(message):
+        await message.answer("РЈ С‚РµР±СЏ РЅРµС‚ РґРѕСЃС‚СѓРїР° Рє СЌС‚РѕР№ РєРѕРјР°РЅРґРµ.")
+        return
+
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer("РСЃРїРѕР»СЊР·СѓР№ С„РѕСЂРјР°С‚: /user user_id")
+        return
+
+    try:
+        user_id = int(parts[1].strip())
+    except ValueError:
+        await message.answer("user_id РґРѕР»Р¶РµРЅ Р±С‹С‚СЊ С‡РёСЃР»РѕРј.")
+        return
+
+    user = get_user(user_id)
+    if not user:
+        await message.answer("РџРѕР»СЊР·РѕРІР°С‚РµР»СЊ РЅРµ РЅР°Р№РґРµРЅ.")
+        return
+
+    username = f"@{user['username']}" if user.get("username") else "Р±РµР· username"
+    full_name = " ".join(
+        part for part in [user.get("first_name", ""), user.get("last_name", "")] if part
+    ).strip() or "Р‘РµР· РёРјРµРЅРё"
+
+    await message.answer(
+        "РљР°СЂС‚РѕС‡РєР° РїРѕР»СЊР·РѕРІР°С‚РµР»СЏ:\n\n"
+        f"РќРѕРјРµСЂ Р·Р°РєР°Р·Р°: {user.get('order_number', 0) or 'РќРµС‚'}\n"
+        f"ID: {user['id']}\n"
+        f"РРјСЏ: {full_name}\n"
+        f"Username: {username}\n"
+        f"Р”Р°С‚Р° РїРµСЂРІРѕРіРѕ РІС…РѕРґР°: {user.get('first_seen', '-')}\n"
+        f"РџРѕСЃР»РµРґРЅСЏСЏ Р°РєС‚РёРІРЅРѕСЃС‚СЊ: {user.get('last_seen', '-')}\n"
+        f"РЎС‚СЂР°РЅР°: {user.get('country', '') or 'РќРµ РІС‹Р±СЂР°РЅР°'}\n"
+        f"РЎС‚Р°С‚СѓСЃ: {user.get('status', '') or 'РќРѕРІС‹Р№'}\n"
+        f"РџРѕРїС‹С‚РѕРє РїРѕРёСЃРєР°: {int(user.get('search_access', 0) or 0)}\n"
+        f"РўСЂРµРє-РєРѕРґ: {user.get('tracking_code', '') or 'РќРµС‚'}\n"
+        f"Р­С‚Р°Рї РґРѕСЃС‚Р°РІРєРё: {user.get('tracking_stage', '') or 'РќРµС‚'}\n"
+        f"Р—Р°РјРµС‚РєР°: {user.get('note', '') or 'РќРµС‚'}"
+    )
+
+
+@dp.message(Command("owner"))
+async def tracking_owner(message: Message) -> None:
+    if not is_admin(message):
+        await message.answer("РЈ С‚РµР±СЏ РЅРµС‚ РґРѕСЃС‚СѓРїР° Рє СЌС‚РѕР№ РєРѕРјР°РЅРґРµ.")
+        return
+
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        await message.answer("РСЃРїРѕР»СЊР·СѓР№ С„РѕСЂРјР°С‚: /owner РєРѕРґ")
+        return
+
+    tracking_code = parts[1].strip().upper()
+    _, user = get_user_by_tracking_code(tracking_code)
+    if not user:
+        await message.answer("Р—Р°РєР°Р· СЃ С‚Р°РєРёРј РєРѕРґРѕРј РЅРµ РЅР°Р№РґРµРЅ.")
+        return
+
+    await message.answer(
+        "Р’Р»Р°РґРµР»РµС† С‚СЂРµРє-РєРѕРґР°:\n\n"
+        f"{format_order_card(user)}"
+    )
+
+
+@dp.message(Command("note"))
+async def admin_note(message: Message) -> None:
+    if not is_admin(message):
+        await message.answer("РЈ С‚РµР±СЏ РЅРµС‚ РґРѕСЃС‚СѓРїР° Рє СЌС‚РѕР№ РєРѕРјР°РЅРґРµ.")
+        return
+
+    parts = (message.text or "").split(maxsplit=2)
+    if len(parts) < 3:
+        await message.answer("РСЃРїРѕР»СЊР·СѓР№ С„РѕСЂРјР°С‚: /note user_id С‚РµРєСЃС‚")
+        return
+
+    try:
+        user_id = int(parts[1].strip())
+    except ValueError:
+        await message.answer("user_id РґРѕР»Р¶РµРЅ Р±С‹С‚СЊ С‡РёСЃР»РѕРј.")
+        return
+
+    note = parts[2].strip()
+    if not note:
+        await message.answer("Р—Р°РјРµС‚РєР° РЅРµ РґРѕР»Р¶РЅР° Р±С‹С‚СЊ РїСѓСЃС‚РѕР№.")
+        return
+
+    if not set_user_note(user_id, note):
+        await message.answer("РџРѕР»СЊР·РѕРІР°С‚РµР»СЊ РЅРµ РЅР°Р№РґРµРЅ.")
+        return
+
+    await message.answer(f"Р—Р°РјРµС‚РєР° РґР»СЏ РїРѕР»СЊР·РѕРІР°С‚РµР»СЏ {user_id} СЃРѕС…СЂР°РЅРµРЅР°.")
+
+
+@dp.message(Command("clearnote"))
+async def admin_clear_note(message: Message) -> None:
+    if not is_admin(message):
+        await message.answer("РЈ С‚РµР±СЏ РЅРµС‚ РґРѕСЃС‚СѓРїР° Рє СЌС‚РѕР№ РєРѕРјР°РЅРґРµ.")
+        return
+
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer("РСЃРїРѕР»СЊР·СѓР№ С„РѕСЂРјР°С‚: /clearnote user_id")
+        return
+
+    try:
+        user_id = int(parts[1].strip())
+    except ValueError:
+        await message.answer("user_id РґРѕР»Р¶РµРЅ Р±С‹С‚СЊ С‡РёСЃР»РѕРј.")
+        return
+
+    if not set_user_note(user_id, ""):
+        await message.answer("РџРѕР»СЊР·РѕРІР°С‚РµР»СЊ РЅРµ РЅР°Р№РґРµРЅ.")
+        return
+
+    await message.answer(f"Р—Р°РјРµС‚РєР° РїРѕР»СЊР·РѕРІР°С‚РµР»СЏ {user_id} РѕС‡РёС‰РµРЅР°.")
+
+
+@dp.message(Command("status"))
+async def admin_status(message: Message) -> None:
+    if not is_admin(message):
+        await message.answer("РЈ С‚РµР±СЏ РЅРµС‚ РґРѕСЃС‚СѓРїР° Рє СЌС‚РѕР№ РєРѕРјР°РЅРґРµ.")
+        return
+
+    parts = (message.text or "").split(maxsplit=2)
+    if len(parts) < 3:
+        await message.answer("РСЃРїРѕР»СЊР·СѓР№ С„РѕСЂРјР°С‚: /status user_id РЅРѕРІС‹Р№_СЃС‚Р°С‚СѓСЃ")
+        return
+
+    try:
+        user_id = int(parts[1].strip())
+    except ValueError:
+        await message.answer("user_id РґРѕР»Р¶РµРЅ Р±С‹С‚СЊ С‡РёСЃР»РѕРј.")
+        return
+
+    user = get_user(user_id)
+    if not user:
+        await message.answer("РџРѕР»СЊР·РѕРІР°С‚РµР»СЊ РЅРµ РЅР°Р№РґРµРЅ.")
+        return
+
+    new_status = parts[2].strip()
+    if not new_status:
+        await message.answer("РЎС‚Р°С‚СѓСЃ РЅРµ РґРѕР»Р¶РµРЅ Р±С‹С‚СЊ РїСѓСЃС‚С‹Рј.")
+        return
+
+    set_user_status(user_id, new_status)
+    await message.answer(f"РЎС‚Р°С‚СѓСЃ РїРѕР»СЊР·РѕРІР°С‚РµР»СЏ {user_id} РѕР±РЅРѕРІР»РµРЅ: {new_status}")
+
+
+@dp.message(Command("find"))
+async def admin_find(message: Message) -> None:
+    if not is_admin(message):
+        await message.answer("РЈ С‚РµР±СЏ РЅРµС‚ РґРѕСЃС‚СѓРїР° Рє СЌС‚РѕР№ РєРѕРјР°РЅРґРµ.")
+        return
+
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        await message.answer("РСЃРїРѕР»СЊР·СѓР№ С„РѕСЂРјР°С‚: /find РЅР°Р·РІР°РЅРёРµ РІРµС‰Рё")
+        return
+
+    query = parts[1].strip()
+    await message.answer("РС‰Сѓ РїРѕ С‚РІРѕРёРј СЃСЃС‹Р»РєР°Рј, РїРѕРґРѕР¶РґРё РЅРµРјРЅРѕРіРѕ...")
+    results = await search_item_in_sources(query)
+    await message.answer(build_result_text(results))
+
+
+@dp.message(Command("track"))
+async def track_order(message: Message) -> None:
+    if await maintenance_guard(message):
+        return
+    if is_rate_limited(message):
+        await maybe_send_rate_limit_notice(message)
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        await message.answer("РСЃРїРѕР»СЊР·СѓР№ С„РѕСЂРјР°С‚: /track РєРѕРґ")
+        return
+
+    tracking_code = parts[1].strip().upper()
+    _, user = get_user_by_tracking_code(tracking_code)
+    if not user:
+        await message.answer("Р—Р°РєР°Р· СЃ С‚Р°РєРёРј РєРѕРґРѕРј РЅРµ РЅР°Р№РґРµРЅ.")
+        return
+
+    await message.answer(
+        f"РўСЂРµРє-РєРѕРґ: {tracking_code}\n"
+        f"РўРµРєСѓС‰РёР№ СЌС‚Р°Рї: {user.get('tracking_stage', '') or 'Р­С‚Р°Рї РїРѕРєР° РЅРµ РЅР°Р·РЅР°С‡РµРЅ'}"
+    )
+
+
+@dp.message(Command("trackset"))
+async def track_set(message: Message, bot: Bot) -> None:
+    if not is_admin(message):
+        await message.answer("РЈ С‚РµР±СЏ РЅРµС‚ РґРѕСЃС‚СѓРїР° Рє СЌС‚РѕР№ РєРѕРјР°РЅРґРµ.")
+        return
+
+    parts = (message.text or "").split(maxsplit=2)
+    if len(parts) < 3:
+        await message.answer("РСЃРїРѕР»СЊР·СѓР№ С„РѕСЂРјР°С‚: /trackset РєРѕРґ СЌС‚Р°Рї")
+        return
+
+    tracking_code = parts[1].strip().upper()
+    stage_key = parts[2].strip()
+    if stage_key not in TRACKING_STAGES:
+        await message.answer(
+            "Р”РѕСЃС‚СѓРїРЅС‹Рµ СЌС‚Р°РїС‹:\n"
+            "1 - Р’С‹РєСѓРїР»РµРЅ\n"
+            "2 - РџСЂРёРµС…Р°Р» РЅР° СЃРєР»Р°Рґ\n"
+            "3 - РћС‚РїСЂР°РІР»РµРЅ\n"
+            "4 - РџСЂРёРµС…Р°Р» РІ Р Р¤"
+        )
+        return
+
+    await apply_tracking_stage_change(message, bot, tracking_code, stage_key)
+
+
+async def handle_quick_stage(message: Message, bot: Bot, stage_key: str) -> None:
+    if not is_admin(message):
+        await message.answer("РЈ С‚РµР±СЏ РЅРµС‚ РґРѕСЃС‚СѓРїР° Рє СЌС‚РѕР№ РєРѕРјР°РЅРґРµ.")
+        return
+
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        await message.answer("РћС‚РїСЂР°РІСЊ РєРѕРјР°РЅРґСѓ СЃ С‚СЂРµРє-РєРѕРґРѕРј.")
+        return
+
+    tracking_code = parts[1].strip().upper()
+    await apply_tracking_stage_change(message, bot, tracking_code, stage_key)
+
+
+@dp.message(Command("vykup"))
+async def quick_vykup(message: Message, bot: Bot) -> None:
+    await handle_quick_stage(message, bot, "1")
+
+
+@dp.message(Command("sklad"))
+async def quick_sklad(message: Message, bot: Bot) -> None:
+    await handle_quick_stage(message, bot, "2")
+
+
+@dp.message(Command("otpravlen"))
+async def quick_otpravlen(message: Message, bot: Bot) -> None:
+    await handle_quick_stage(message, bot, "3")
+
+
+@dp.message(Command("rf"))
+async def quick_rf(message: Message, bot: Bot) -> None:
+    await handle_quick_stage(message, bot, "4")
+
+
+@dp.message(Command("users"))
+async def list_users(message: Message) -> None:
+    if not is_admin(message):
+        await message.answer("РЈ С‚РµР±СЏ РЅРµС‚ РґРѕСЃС‚СѓРїР° Рє СЌС‚РѕР№ РєРѕРјР°РЅРґРµ.")
+        return
+
+    users = load_users()
+    if not users:
+        await message.answer("РџРѕРєР° РЅРµС‚ РїРѕР»СЊР·РѕРІР°С‚РµР»РµР№, РєРѕС‚РѕСЂС‹Рµ РїРёСЃР°Р»Рё Р±РѕС‚Сѓ.")
+        return
+
+    lines = []
+    for user in sorted(users.values(), key=lambda item: item.get("last_seen", ""), reverse=True):
+        username = f"@{user['username']}" if user.get("username") else "Р±РµР· username"
+        full_name = " ".join(
+            part for part in [user.get("first_name", ""), user.get("last_name", "")] if part
+        ).strip() or "Р‘РµР· РёРјРµРЅРё"
+        lines.append(
+            f"Р—Р°РєР°Р· в„–{user.get('order_number', 0) or '-'} | {user['id']} | {full_name} | {username}\n"
+            f"Р”Р°С‚Р°: {user.get('first_seen', '-')}\n"
+            f"РЎС‚СЂР°РЅР°: {user.get('country', '') or 'РќРµ РІС‹Р±СЂР°РЅР°'}\n"
+            f"РЎС‚Р°С‚СѓСЃ: {user.get('status', '') or 'РќРѕРІС‹Р№'}\n"
+            f"РџРѕРїС‹С‚РѕРє РїРѕРёСЃРєР°: {int(user.get('search_access', 0) or 0)}\n"
+            f"РўСЂРµРє-РєРѕРґ: {user.get('tracking_code', '') or 'РќРµС‚'}\n"
+            f"Р­С‚Р°Рї: {user.get('tracking_stage', '') or 'РќРµС‚'}"
+        )
+
+    await send_long_text(message, "РџРѕР»СЊР·РѕРІР°С‚РµР»Рё:\n\n" + "\n\n".join(lines))
+
+
+@dp.message(Command("send"))
+async def send_to_user(message: Message, bot: Bot) -> None:
+    if not is_admin(message):
+        await message.answer("РЈ С‚РµР±СЏ РЅРµС‚ РґРѕСЃС‚СѓРїР° Рє СЌС‚РѕР№ РєРѕРјР°РЅРґРµ.")
+        return
+
+    parts = (message.text or "").split(maxsplit=2)
+    if len(parts) < 3:
+        await message.answer("РСЃРїРѕР»СЊР·СѓР№ С„РѕСЂРјР°С‚: /send user_id С‚РµРєСЃС‚")
+        return
+
+    try:
+        user_id = int(parts[1].strip())
+    except ValueError:
+        await message.answer("user_id РґРѕР»Р¶РµРЅ Р±С‹С‚СЊ С‡РёСЃР»РѕРј.")
+        return
+
+    try:
+        await bot.send_message(user_id, parts[2].strip())
+        await message.answer(f"РЎРѕРѕР±С‰РµРЅРёРµ РѕС‚РїСЂР°РІР»РµРЅРѕ РїРѕР»СЊР·РѕРІР°С‚РµР»СЋ {user_id}.")
+    except Exception as error:
+        await message.answer(f"РќРµ СѓРґР°Р»РѕСЃСЊ РѕС‚РїСЂР°РІРёС‚СЊ СЃРѕРѕР±С‰РµРЅРёРµ: {error}")
+
+
+@dp.message(Command("done"))
+async def send_done_message(message: Message, bot: Bot) -> None:
+    if not is_admin(message):
+        await message.answer("РЈ С‚РµР±СЏ РЅРµС‚ РґРѕСЃС‚СѓРїР° Рє СЌС‚РѕР№ РєРѕРјР°РЅРґРµ.")
+        return
+
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer("РСЃРїРѕР»СЊР·СѓР№ С„РѕСЂРјР°С‚: /done user_id")
+        return
+
+    try:
+        user_id = int(parts[1].strip())
+    except ValueError:
+        await message.answer("user_id РґРѕР»Р¶РµРЅ Р±С‹С‚СЊ С‡РёСЃР»РѕРј.")
+        return
+
+    user = get_user(user_id)
+    if not can_approve_order(user):
+        await message.answer(
+            "РќРµР»СЊР·СЏ РѕРґРѕР±СЂРёС‚СЊ СЌС‚РѕС‚ Р·Р°РєР°Р·. РљРѕРґ РІС‹РґР°РµС‚СЃСЏ С‚РѕР»СЊРєРѕ РµСЃР»Рё РїРѕР»СЊР·РѕРІР°С‚РµР»СЊ СѓР¶Рµ РѕС‚РїСЂР°РІРёР» Р·Р°СЏРІРєСѓ."
+        )
+        return
+
+    try:
+        tracking_code = assign_tracking_code(user_id)
+        set_user_status(user_id, "Р—Р°РєР°Р· РѕР±СЂР°Р±РѕС‚Р°РЅ")
+        await bot.send_message(
+            user_id,
+            "Р’Р°С€ Р·Р°РєР°Р· РѕР±СЂР°Р±РѕС‚Р°РЅ.\n"
+            f"Р’Р°С€ РєРѕРґ РґР»СЏ РѕС‚СЃР»РµР¶РёРІР°РЅРёСЏ Р·Р°РєР°Р·Р°: {tracking_code}\n"
+            f"РўРµРєСѓС‰РёР№ СЌС‚Р°Рї: {TRACKING_STAGES['1']}"
+        )
+        await message.answer(
+            f"Р—Р°РєР°Р· РѕР±СЂР°Р±РѕС‚Р°РЅ.\n"
+            f"РљРѕРґ: {tracking_code}\n"
+            f"РџРѕР»СЊР·РѕРІР°С‚РµР»СЊ: {user_id}"
+        )
+    except Exception as error:
+        await message.answer(f"РќРµ СѓРґР°Р»РѕСЃСЊ РѕС‚РїСЂР°РІРёС‚СЊ СЃРѕРѕР±С‰РµРЅРёРµ: {error}")
+
+
+@dp.message(Command("cancel"))
+async def cancel_order(message: Message, bot: Bot) -> None:
+    if not is_admin(message):
+        await message.answer("РЈ С‚РµР±СЏ РЅРµС‚ РґРѕСЃС‚СѓРїР° Рє СЌС‚РѕР№ РєРѕРјР°РЅРґРµ.")
+        return
+
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer("РСЃРїРѕР»СЊР·СѓР№ С„РѕСЂРјР°С‚: /cancel user_id")
+        return
+
+    try:
+        user_id = int(parts[1].strip())
+    except ValueError:
+        await message.answer("user_id РґРѕР»Р¶РµРЅ Р±С‹С‚СЊ С‡РёСЃР»РѕРј.")
+        return
+
+    user = get_user(user_id)
+    if not can_cancel_order(user):
+        await message.answer("Р­С‚РѕС‚ Р·Р°РєР°Р· РЅРµР»СЊР·СЏ РѕС‚РјРµРЅРёС‚СЊ РёР»Рё РїРѕР»СЊР·РѕРІР°С‚РµР»СЊ РЅРµ РЅР°Р№РґРµРЅ.")
+        return
+
+    order_number = user.get("order_number", 0) if user else 0
+    tracking_code = user.get("tracking_code", "") if user else ""
+    canceled_user = cancel_user_order(user_id)
+    china_order_users.discard(user_id)
+    admin_search_users.discard(user_id)
+    tracking_lookup_users.discard(user_id)
+
+    if not canceled_user:
+        await message.answer("РќРµ СѓРґР°Р»РѕСЃСЊ РѕС‚РјРµРЅРёС‚СЊ Р·Р°РєР°Р·.")
+        return
+
+    try:
+        lines = ["Р’Р°С€ Р·Р°РєР°Р· РѕС‚РјРµРЅРµРЅ."]
+        if order_number:
+            lines.append(f"РќРѕРјРµСЂ Р·Р°РєР°Р·Р°: {order_number}")
+        if tracking_code:
+            lines.append(f"РўСЂРµРє-РєРѕРґ: {tracking_code}")
+
+        await bot.send_message(
+            user_id,
+            "\n".join(lines),
+            reply_markup=user_main_keyboard,
+        )
+    except Exception:
+        pass
+
+    await message.answer(
+        "Р—Р°РєР°Р· РѕС‚РјРµРЅРµРЅ.\n"
+        f"РџРѕР»СЊР·РѕРІР°С‚РµР»СЊ: {user_id}\n"
+        f"РќРѕРјРµСЂ Р·Р°РєР°Р·Р°: {order_number or 'РќРµС‚'}\n"
+        f"РўСЂРµРє-РєРѕРґ: {tracking_code or 'РќРµС‚'}"
+    )
+
+
+@dp.message(F.text == "Неодобренные заказы")
+async def pending_orders_button(message: Message) -> None:
+    if not is_admin(message):
+        return
+
+    pending = get_pending_orders()
+    if not pending:
+        await message.answer("РќРµРѕРґРѕР±СЂРµРЅРЅС‹С… Р·Р°РєР°Р·РѕРІ СЃРµР№С‡Р°СЃ РЅРµС‚.")
+        return
+
+    lines = [format_order_card(user, include_action_hint=True) for user in pending]
+    await send_long_text(message, "РќРµРѕРґРѕР±СЂРµРЅРЅС‹Рµ Р·Р°РєР°Р·С‹:\n\n" + "\n\n".join(lines))
+
+
+@dp.message(F.text == "Все заказы и их статусы")
+async def all_orders_button(message: Message) -> None:
+    if not is_admin(message):
+        return
+
+    orders = get_all_orders()
+    if not orders:
+        await message.answer("Р—Р°РєР°Р·РѕРІ РїРѕРєР° РЅРµС‚.")
+        return
+
+    lines = [format_order_card(user, include_action_hint=True) for user in orders]
+    await send_long_text(message, "Р’СЃРµ Р·Р°РєР°Р·С‹ Рё РёС… СЃС‚Р°С‚СѓСЃС‹:\n\n" + "\n\n".join(lines))
+
+
+@dp.message(F.text == "Сделать заказ")
+async def make_order(message: Message) -> None:
+    if await maintenance_guard(message):
+        return
+    if is_rate_limited(message):
+        await maybe_send_rate_limit_notice(message)
+        return
+    update_user(message, status="Р’С‹Р±РёСЂР°РµС‚ СЂР°Р·РґРµР» Р·Р°РєР°Р·Р°")
+    await send_photo_or_text(
+        message,
+        ORDER_IMAGE,
+        "Выбери страну, из которой хочешь сделать заказ:",
+        reply_markup=user_order_keyboard,
+    )
+
+
+@dp.message(F.text == "Найти эту вещь в Китае")
+async def search_item_tab(message: Message) -> None:
+    if await maintenance_guard(message):
+        return
+    if is_rate_limited(message):
+        await maybe_send_rate_limit_notice(message)
+        return
+
+    user = update_user(message)
+    if not message.from_user or not user:
+        return
+
+    user_id = message.from_user.id
+    china_order_users.discard(user_id)
+    tracking_lookup_users.discard(user_id)
+
+    if is_admin(message):
+        paid_search_users.discard(user_id)
+        admin_search_users.add(user_id)
+        await message.answer(
+            "РџСЂРёС€Р»Рё РЅР°Р·РІР°РЅРёРµ РІРµС‰Рё С‚РµРєСЃС‚РѕРј РёР»Рё С„РѕС‚Рѕ СЃ РїРѕРґРїРёСЃСЊСЋ РґР»СЏ РїРѕРёСЃРєР° РїРѕ С‚РІРѕРёРј СЃСЃС‹Р»РєР°Рј.\n"
+            "Р§С‚РѕР±С‹ РІС‹Р№С‚Рё РёР· СЂРµР¶РёРјР° РїРѕРёСЃРєР°, РЅР°Р¶РјРё 'РќР°Р·Р°Рґ'."
+        )
+        return
+
+    admin_search_users.discard(user_id)
+    credits = int(user.get("search_access", 0) or 0)
+    if credits <= 0:
+        await message.answer(
+            "РџРѕРёСЃРє РІРµС‰Рё РІ РљРёС‚Р°Рµ РґР»СЏ РїРѕР»СЊР·РѕРІР°С‚РµР»РµР№ РґРѕСЃС‚СѓРїРµРЅ С‚РѕР»СЊРєРѕ РїРѕСЃР»Рµ РѕРїР»Р°С‚С‹.\n"
+            "Р§С‚РѕР±С‹ РїРѕР»СѓС‡РёС‚СЊ РґРѕСЃС‚СѓРї, РЅР°РїРёС€Рё РІ С‚РµС…РїРѕРґРґРµСЂР¶РєСѓ: @ichov",
+            reply_markup=current_main_keyboard(message),
+        )
+        return
+
+    paid_search_users.add(user_id)
+    await message.answer(
+        "Р”РѕСЃС‚СѓРї Рє РїРѕРёСЃРєСѓ Р°РєС‚РёРІРёСЂРѕРІР°РЅ.\n"
+        f"РћСЃС‚Р°Р»РѕСЃСЊ РїРѕРїС‹С‚РѕРє РїРѕРёСЃРєР°: {credits}\n"
+        "РџСЂРёС€Р»Рё РЅР°Р·РІР°РЅРёРµ РІРµС‰Рё С‚РµРєСЃС‚РѕРј, Рё СЏ РЅР°С‡РЅСѓ РїРѕРёСЃРє.\n"
+        "РџРѕРёСЃРє РїРѕ С„РѕС‚Рѕ РґРѕСЃС‚СѓРїРµРЅ С‚РѕР»СЊРєРѕ Р°РґРјРёРЅСѓ.\n"
+        "Р§С‚РѕР±С‹ РІС‹Р№С‚Рё РёР· СЂРµР¶РёРјР° РїРѕРёСЃРєР°, РЅР°Р¶РјРё 'РќР°Р·Р°Рґ'."
+    )
+
+
+@dp.message(F.text == "Тарифы")
+async def tariffs(message: Message) -> None:
+    if await maintenance_guard(message):
+        return
+    if is_rate_limited(message):
+        await maybe_send_rate_limit_notice(message)
+        return
+    update_user(message)
+    await send_photo_or_text(
+        message,
+        TARIFF_IMAGE,
+        "НАШ ТАРИФ, что он включает?!\n"
+        "он включает два вида доставки\n\n"
+        "1.Китай-Благовещенск-Керчь\n"
+        "2.Китай-Москва-Керчь\n\n"
+        "Ценник фиксированный - 6$ за кг\n\n"
+        "ДОСТАВКА СДЭК ОПЛАЧИВАЕТСЯ ОТДЕЛЬНО",
+    )
+    return
+    await send_photo_or_text(
+        message,
+        TARIFF_IMAGE,
+        "РџРѕРєР° С‡С‚Рѕ СЃСѓС‰РµСЃС‚РІСѓРµС‚ 1 РµРґРёРЅСЃС‚РІРµРЅРЅС‹Р№ С‚Р°СЂРёС„, СЌС‚Рѕ 20-30 РґРЅРµР№ "
+        "СЃ РјРѕРјРµРЅС‚Р° РѕС‚РїСЂР°РІРєРё СЃРѕ СЃРєР»Р°РґР° - 6 РґРѕР»Р»Р°СЂРѕРІ Р·Р° РєРі",
+    )
+
+
+@dp.message(Command("setyuan"))
+async def set_yuan_rate_command(message: Message) -> None:
+    if not is_admin(message):
+        await message.answer("У тебя нет доступа к этой команде.")
+        return
+
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        await message.answer("Используй формат: /setyuan 12,0")
+        return
+
+    raw_input = parts[1].strip()
+    numeric_value = raw_input.replace(",", ".")
+    try:
+        float(numeric_value)
+    except ValueError:
+        await message.answer("Курс должен быть числом, например 12,0 или 12.0")
+        return
+
+    display_value = raw_input.replace(".", ",")
+    set_yuan_rate(display_value)
+    await message.answer(f"Курс юаня обновлен: {display_value}")
+
+
+@dp.message(F.text == "Курс юаня")
+async def yuan_rate_tab(message: Message) -> None:
+    if await maintenance_guard(message):
+        return
+    if is_rate_limited(message):
+        await maybe_send_rate_limit_notice(message)
+        return
+    update_user(message)
+    await send_photo_or_text(
+        message,
+        YUAN_IMAGE,
+        f"Курс юаня {get_yuan_rate()}",
+    )
+
+
+@dp.message(F.text == "Инфо")
+async def info(message: Message) -> None:
+    if await maintenance_guard(message):
+        return
+    if is_rate_limited(message):
+        await maybe_send_rate_limit_notice(message)
+        return
+    update_user(message)
+    tracking_lookup_users.discard(message.from_user.id if message.from_user else -1)
+    await send_photo_or_text(
+        message,
+        INFO_IMAGE,
+        "Фотоотчет отправляется прямо в бот.\n"
+        "Время работы бота: 8:00 - 20:00 (временно).\n"
+        "Здесь ты можешь узнать статус заказа, посмотреть свой заказ и остаток попыток поиска.",
+        reply_markup=info_keyboard,
+    )
+
+
+@dp.message(F.text == "Мой заказ")
+async def my_order(message: Message) -> None:
+    if await maintenance_guard(message):
+        return
+    if is_rate_limited(message):
+        await maybe_send_rate_limit_notice(message)
+        return
+    update_user(message)
+    if not message.from_user:
+        return
+
+    user = get_user(message.from_user.id)
+    if not user:
+        await message.answer("Пока нет данных по твоему заказу.", reply_markup=info_keyboard)
+        return
+
+    has_order = bool(
+        user.get("order_number", 0)
+        or user.get("tracking_code")
+        or user.get("status") in ACTIVE_ORDER_STATUSES
+    )
+    if not has_order:
+        await message.answer(
+            "РЈ С‚РµР±СЏ РїРѕРєР° РЅРµС‚ Р°РєС‚РёРІРЅРѕРіРѕ Р·Р°РєР°Р·Р°.\n"
+            "Р•СЃР»Рё С…РѕС‡РµС€СЊ РѕС„РѕСЂРјРёС‚СЊ Р·Р°РєР°Р·, Р·Р°Р№РґРё РІ СЂР°Р·РґРµР» 'РЎРґРµР»Р°С‚СЊ Р·Р°РєР°Р·'.",
+            reply_markup=info_keyboard,
+        )
+        return
+
+    await message.answer(
+        "РўРІРѕР№ Р·Р°РєР°Р·:\n\n"
+        f"РќРѕРјРµСЂ Р·Р°РєР°Р·Р°: {user.get('order_number', 0) or 'Р•С‰Рµ РЅРµ РїСЂРёСЃРІРѕРµРЅ'}\n"
+        f"РЎС‚Р°С‚СѓСЃ: {user.get('status', '') or 'РќРѕРІС‹Р№'}\n"
+        f"РўСЂРµРє-РєРѕРґ: {user.get('tracking_code', '') or 'РџРѕРєР° РЅРµС‚'}\n"
+        f"Р­С‚Р°Рї: {user.get('tracking_stage', '') or 'РџРѕРєР° РЅРµ РЅР°Р·РЅР°С‡РµРЅ'}",
+        reply_markup=info_keyboard,
+    )
+
+
+@dp.message(F.text == "Мои попытки поиска")
+async def my_search_attempts(message: Message) -> None:
+    if await maintenance_guard(message):
+        return
+    if is_rate_limited(message):
+        await maybe_send_rate_limit_notice(message)
+        return
+    update_user(message)
+    if not message.from_user:
+        return
+
+    if is_admin(message):
+        await message.answer(
+            "РЈ С‚РµР±СЏ РєР°Рє Сѓ Р°РґРјРёРЅР° РїРѕРёСЃРє РїРѕ С„РѕС‚Рѕ Рё РїРѕ РЅР°Р·РІР°РЅРёСЋ РґРѕСЃС‚СѓРїРµРЅ Р±РµР· РѕРіСЂР°РЅРёС‡РµРЅРёР№.",
+            reply_markup=info_keyboard,
+        )
+        return
+
+    user = get_user(message.from_user.id)
+    credits = int((user or {}).get("search_access", 0) or 0)
+    if credits <= 0:
+        await message.answer(
+            "РЈ С‚РµР±СЏ СЃРµР№С‡Р°СЃ РЅРµС‚ РїРѕРїС‹С‚РѕРє РїРѕРёСЃРєР°.\n"
+            "Р§С‚РѕР±С‹ РїРѕР»СѓС‡РёС‚СЊ РїР»Р°С‚РЅС‹Р№ РґРѕСЃС‚СѓРї, РЅР°РїРёС€Рё РІ С‚РµС…РїРѕРґРґРµСЂР¶РєСѓ: @ichov",
+            reply_markup=info_keyboard,
+        )
+        return
+
+    await message.answer(
+        f"РЈ С‚РµР±СЏ РѕСЃС‚Р°Р»РѕСЃСЊ РїРѕРїС‹С‚РѕРє РїРѕРёСЃРєР°: {credits}\n"
+        "РСЃРїРѕР»СЊР·РѕРІР°С‚СЊ РёС… РјРѕР¶РЅРѕ РІ СЂР°Р·РґРµР»Рµ 'РЎРґРµР»Р°С‚СЊ Р·Р°РєР°Р·' -> 'РќР°Р№С‚Рё СЌС‚Сѓ РІРµС‰СЊ РІ РљРёС‚Р°Рµ'.",
+        reply_markup=info_keyboard,
+    )
+
+
+@dp.message(F.text == "Узнать статус заказа")
+async def ask_tracking_code(message: Message) -> None:
+    if await maintenance_guard(message):
+        return
+    if is_rate_limited(message):
+        await maybe_send_rate_limit_notice(message)
+        return
+    update_user(message)
+    if message.from_user:
+        tracking_lookup_users.add(message.from_user.id)
+    await message.answer(
+        "РћС‚РїСЂР°РІСЊ СЃРІРѕР№ С‚СЂРµРє-РєРѕРґ, Рё СЏ РїРѕРєР°Р¶Сѓ С‚РµРєСѓС‰РёР№ СЃС‚Р°С‚СѓСЃ Р·Р°РєР°Р·Р°.",
+        reply_markup=info_keyboard,
+    )
+
+
+@dp.message(F.text == "Тех. поддержка")
+async def support(message: Message) -> None:
+    if await maintenance_guard(message):
+        return
+    if is_rate_limited(message):
+        await maybe_send_rate_limit_notice(message)
+        return
+    update_user(message)
+    await send_photo_or_text(
+        message,
+        SUPPORT_IMAGE,
+        "РџРѕ РІСЃРµРј РІРѕРїСЂРѕСЃР°Рј С‚РµС…РїРѕРґРґРµСЂР¶РєРё РїРёС€Рё: @ichov",
+    )
+
+
+@dp.message(F.text == "Китай")
+async def china_order(message: Message, bot: Bot) -> None:
+    if await maintenance_guard(message):
+        return
+    if is_rate_limited(message):
+        await maybe_send_rate_limit_notice(message)
+        return
+    user = update_user(message, country="РљРёС‚Р°Р№", status="РћС„РѕСЂРјР»СЏРµС‚ Р·Р°РєР°Р·")
+    if not message.from_user or not user:
+        return
+
+    china_order_users.add(message.from_user.id)
+    tracking_lookup_users.discard(message.from_user.id)
+    await message.answer(
+        "РўРѕРіРґР° СЃРєРёРґС‹РІР°Р№ СЃСЃС‹Р»РєСѓ С‚РѕРІР°СЂР°, С„РѕС‚Рѕ С‚РѕРІР°СЂР°, СЂР°Р·РјРµСЂ, С†РІРµС‚.",
+        reply_markup=china_submit_keyboard,
+    )
+    await bot.send_message(
+        ADMIN_ID,
+        f"РџРѕР»СЊР·РѕРІР°С‚РµР»СЊ {message.from_user.full_name} "
+        f"(ID: {message.from_user.id}) РЅР°С‡Р°Р» Р·Р°РєР°Р· РёР· РљРёС‚Р°СЏ.",
+    )
+
+
+@dp.message(F.text.in_(["РЎС€Р°", "РљРѕСЂРµСЏ"]))
+async def other_country_order(message: Message) -> None:
+    if await maintenance_guard(message):
+        return
+    if is_rate_limited(message):
+        await maybe_send_rate_limit_notice(message)
+        return
+    update_user(message, country=message.text, status="Р’СЂРµРјРµРЅРЅРѕ Р·Р°РєСЂС‹С‚Рѕ")
+    await message.answer("Р’СЂРµРјРµРЅРЅРѕ Р·Р°РєСЂС‹С‚Рѕ.", reply_markup=current_main_keyboard(message))
+
+
+@dp.message(F.text == "Я все скинул")
+async def finish_china_order(message: Message, bot: Bot) -> None:
+    if await maintenance_guard(message):
+        return
+    if is_rate_limited(message):
+        await maybe_send_rate_limit_notice(message)
+        return
+    if not message.from_user or message.from_user.id not in china_order_users:
+        update_user(message)
+        await message.answer("РЎРЅР°С‡Р°Р»Р° РІС‹Р±РµСЂРё СЂР°Р·РґРµР» 'РЎРґРµР»Р°С‚СЊ Р·Р°РєР°Р·' Рё Р·Р°С‚РµРј 'РљРёС‚Р°Р№'.")
+        return
+
+    order_number = assign_order_number(message.from_user.id)
+    update_user(message, country="РљРёС‚Р°Р№", status="Р—Р°СЏРІРєР° РѕС‚РїСЂР°РІР»РµРЅР°")
+    china_order_users.discard(message.from_user.id)
+    await message.answer(
+        f"Р“РѕС‚РѕРІРѕ, РѕР¶РёРґР°Р№С‚Рµ. Р’Р°С€ РЅРѕРјРµСЂ Р·Р°РєР°Р·Р°: {order_number}",
+        reply_markup=current_main_keyboard(message),
+    )
+    await bot.send_message(
+        ADMIN_ID,
+        f"Р—Р°РєР°Р· в„–{order_number}\n"
+        f"РџРѕР»СЊР·РѕРІР°С‚РµР»СЊ {message.from_user.full_name} "
+        f"(ID: {message.from_user.id}) Р·Р°РІРµСЂС€РёР» РѕС‚РїСЂР°РІРєСѓ РґР°РЅРЅС‹С… РїРѕ Р·Р°РєР°Р·Сѓ РёР· РљРёС‚Р°СЏ.",
+    )
+
+
+@dp.message(F.text == "Назад")
+async def back_to_main_menu(message: Message) -> None:
+    if await maintenance_guard(message):
+        return
+    if is_rate_limited(message):
+        await maybe_send_rate_limit_notice(message)
+        return
+    update_user(message, status="Р’ РіР»Р°РІРЅРѕРј РјРµРЅСЋ")
+    if message.from_user:
+        china_order_users.discard(message.from_user.id)
+        admin_search_users.discard(message.from_user.id)
+        paid_search_users.discard(message.from_user.id)
+        tracking_lookup_users.discard(message.from_user.id)
+    user_name = message.from_user.first_name if message.from_user else "РґСЂСѓРі"
+    await send_main_menu(message, user_name)
+
+
+@dp.message()
+async def handle_messages(message: Message, bot: Bot) -> None:
+    if await maintenance_guard(message):
+        return
+    if is_rate_limited(message):
+        await maybe_send_rate_limit_notice(message)
+        return
+
+    update_user(message)
+
+    if not message.from_user:
+        return
+
+    if message.from_user.id in admin_search_users and is_admin(message):
+        query = (message.text or message.caption or "").strip()
+        if not query:
+            await message.answer("Р”Р»СЏ РїРѕРёСЃРєР° РїСЂРёС€Р»Рё РЅР°Р·РІР°РЅРёРµ РІРµС‰Рё С‚РµРєСЃС‚РѕРј РёР»Рё С„РѕС‚Рѕ СЃ РїРѕРґРїРёСЃСЊСЋ.")
+            return
+
+        await message.answer("РС‰Сѓ РїРѕ С‚РІРѕРёРј СЃСЃС‹Р»РєР°Рј, РїРѕРґРѕР¶РґРё РЅРµРјРЅРѕРіРѕ...")
+        results = await search_item_in_sources(query)
+        await message.answer(build_result_text(results))
+        return
+
+    if message.from_user.id in paid_search_users:
+        user = get_user(message.from_user.id)
+        credits = int((user or {}).get("search_access", 0) or 0)
+        if credits <= 0:
+            paid_search_users.discard(message.from_user.id)
+            await message.answer(
+                "РЈ С‚РµР±СЏ Р·Р°РєРѕРЅС‡РёР»РёСЃСЊ РїРѕРїС‹С‚РєРё РїРѕРёСЃРєР°.\n"
+                "Р§С‚РѕР±С‹ РїРѕР»СѓС‡РёС‚СЊ РЅРѕРІС‹Рµ, РЅР°РїРёС€Рё РІ С‚РµС…РїРѕРґРґРµСЂР¶РєСѓ: @ichov",
+                reply_markup=current_main_keyboard(message),
+            )
+            return
+
+        if message.photo:
+            await message.answer("РџРѕРёСЃРє РїРѕ С„РѕС‚Рѕ РґРѕСЃС‚СѓРїРµРЅ С‚РѕР»СЊРєРѕ Р°РґРјРёРЅСѓ. РџСЂРёС€Р»Рё РЅР°Р·РІР°РЅРёРµ РІРµС‰Рё С‚РµРєСЃС‚РѕРј.")
+            return
+
+        query = (message.text or "").strip()
+        if not query:
+            await message.answer("Р”Р»СЏ РїРѕРёСЃРєР° РїСЂРёС€Р»Рё РЅР°Р·РІР°РЅРёРµ РІРµС‰Рё С‚РµРєСЃС‚РѕРј.")
+            return
+
+        remaining = consume_search_credit(message.from_user.id)
+        if remaining is None:
+            paid_search_users.discard(message.from_user.id)
+            await message.answer(
+                "РЈ С‚РµР±СЏ Р·Р°РєРѕРЅС‡РёР»РёСЃСЊ РїРѕРїС‹С‚РєРё РїРѕРёСЃРєР°.\n"
+                "Р§С‚РѕР±С‹ РїРѕР»СѓС‡РёС‚СЊ РЅРѕРІС‹Рµ, РЅР°РїРёС€Рё РІ С‚РµС…РїРѕРґРґРµСЂР¶РєСѓ: @ichov",
+                reply_markup=current_main_keyboard(message),
+            )
+            return
+
+        update_user(message, status="РС‰РµС‚ РІРµС‰СЊ РІ РљРёС‚Р°Рµ")
+        await message.answer("РС‰Сѓ РїРѕ С‚РІРѕРёРј СЃСЃС‹Р»РєР°Рј, РїРѕРґРѕР¶РґРё РЅРµРјРЅРѕРіРѕ...")
+        results = await search_item_in_sources(query)
+        await message.answer(
+            build_result_text(results)
+            + f"\n\nРћСЃС‚Р°Р»РѕСЃСЊ РїРѕРїС‹С‚РѕРє РїРѕРёСЃРєР°: {remaining}"
+        )
+        if remaining <= 0:
+            paid_search_users.discard(message.from_user.id)
+        return
+
+    if message.from_user.id in tracking_lookup_users:
+        tracking_code = (message.text or "").strip().upper()
+        _, user = get_user_by_tracking_code(tracking_code)
+        if not tracking_code:
+            await message.answer("РћС‚РїСЂР°РІСЊ С‚СЂРµРє-РєРѕРґ С‚РµРєСЃС‚РѕРј.")
+            return
+        if not user:
+            await message.answer("Р—Р°РєР°Р· СЃ С‚Р°РєРёРј РєРѕРґРѕРј РЅРµ РЅР°Р№РґРµРЅ.")
+            return
+
+        await message.answer(
+            f"РўСЂРµРє-РєРѕРґ: {tracking_code}\n"
+            f"РўРµРєСѓС‰РёР№ СЌС‚Р°Рї: {user.get('tracking_stage', '') or 'Р­С‚Р°Рї РїРѕРєР° РЅРµ РЅР°Р·РЅР°С‡РµРЅ'}",
+            reply_markup=info_keyboard,
+        )
+        return
+
+    if is_admin(message):
+        if message.text:
+            await message.answer(
+                "Р”Р»СЏ СЂР°Р±РѕС‚С‹ РёСЃРїРѕР»СЊР·СѓР№ РєРѕРјР°РЅРґС‹:\n"
+                "/send user_id С‚РµРєСЃС‚\n"
+                "/done user_id\n"
+                "/cancel user_id\n"
+                "/orders\n"
+                "/active\n"
+                "/tracks\n"
+                "/orderno РЅРѕРјРµСЂ\n"
+                "/today\n"
+                "/recent\n"
+                "/search Р·Р°РїСЂРѕСЃ\n"
+                "/grantsearch user_id [РєРѕР»-РІРѕ]\n"
+                "/setsearch user_id РєРѕР»-РІРѕ\n"
+                "/revokesearch user_id\n"
+                "/searchlist\n"
+                "/status user_id СЃС‚Р°С‚СѓСЃ\n"
+                "/owner РєРѕРґ\n"
+                "/broadcast С‚РµРєСЃС‚\n"
+                "/maintenance on|off\n"
+                "/find РЅР°Р·РІР°РЅРёРµ РІРµС‰Рё\n"
+                "/track РєРѕРґ\n"
+                "/trackset РєРѕРґ СЌС‚Р°Рї\n"
+                "/vykup РєРѕРґ\n"
+                "/sklad РєРѕРґ\n"
+                "/otpravlen РєРѕРґ\n"
+                "/rf РєРѕРґ"
+            )
+        return
+
+    if message.from_user.id in china_order_users:
+        update_user(message, country="РљРёС‚Р°Р№", status="РћС‚РїСЂР°РІР»СЏРµС‚ РґР°РЅРЅС‹Рµ")
+        await notify_admin(bot, message)
+        await bot.forward_message(ADMIN_ID, message.chat.id, message.message_id)
+        await message.answer(
+            "РџСЂРёРЅСЏР». Р•СЃР»Рё РІСЃРµ РѕС‚РїСЂР°РІРёР», РЅР°Р¶РјРё РєРЅРѕРїРєСѓ 'РЇ РІСЃРµ СЃРєРёРЅСѓР»'.",
+            reply_markup=china_submit_keyboard,
+        )
+
+
+async def main() -> None:
+    init_db()
+    migrate_legacy_users()
+    purge_canceled_orders()
+    bot = Bot(token=TOKEN)
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

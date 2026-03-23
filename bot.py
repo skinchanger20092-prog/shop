@@ -1,9 +1,10 @@
-import asyncio
+﻿import asyncio
 import json
 import logging
 import os
 import re
 import secrets
+import shutil
 import sqlite3
 import time
 from datetime import datetime
@@ -16,6 +17,8 @@ from aiogram.filters import Command
 from aiogram.types import FSInputFile, KeyboardButton, Message, ReplyKeyboardMarkup
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
+from openpyxl import load_workbook
+from openpyxl.drawing.image import Image as XLImage
 
 
 load_dotenv()
@@ -31,6 +34,9 @@ TARIFF_IMAGE = BASE_DIR / "tarif.png"
 SUPPORT_IMAGE = BASE_DIR / "teh.png"
 INFO_IMAGE = BASE_DIR / "info.png"
 YUAN_IMAGE = BASE_DIR / "kurs.png"
+CARGO_ORDERS_DIR = BASE_DIR / "cargo_orders"
+CARGO_PHOTOS_DIR = BASE_DIR / "cargo_photos"
+CARGO_TEMPLATE = BASE_DIR / "каргос.xlsx"
 SEARCH_SOURCES = [
     "https://www.goofish.com/",
     "https://mxjstore.x.yupoo.com/albums",
@@ -94,11 +100,13 @@ tracking_lookup_users: set[int] = set()
 search_semaphore = asyncio.Semaphore(3)
 user_request_times: dict[int, list[float]] = {}
 user_last_limit_notice: dict[int, float] = {}
+admin_excel_sessions: dict[int, dict] = {}
 
 user_main_keyboard = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="Сделать заказ")],
         [KeyboardButton(text="Тарифы")],
+        [KeyboardButton(text="Курс юаня")],
         [KeyboardButton(text="Инфо")],
         [KeyboardButton(text="Тех. поддержка")],
     ],
@@ -113,6 +121,7 @@ admin_main_keyboard = ReplyKeyboardMarkup(
         [KeyboardButton(text="Неодобренные заказы")],
         [KeyboardButton(text="Все заказы и их статусы")],
         [KeyboardButton(text="Тарифы")],
+        [KeyboardButton(text="Курс юаня")],
         [KeyboardButton(text="Инфо")],
         [KeyboardButton(text="Тех. поддержка")],
     ],
@@ -124,8 +133,6 @@ user_order_keyboard = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="Китай")],
         [KeyboardButton(text="Найти эту вещь в Китае")],
-        [KeyboardButton(text="Сша")],
-        [KeyboardButton(text="Корея")],
         [KeyboardButton(text="Назад")],
     ],
     resize_keyboard=True,
@@ -139,6 +146,25 @@ china_submit_keyboard = ReplyKeyboardMarkup(
     ],
     resize_keyboard=True,
     input_field_placeholder="Отправь данные по заказу или нажми кнопку ниже",
+)
+
+payment_keyboard = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="Оплатить заказ")],
+        [KeyboardButton(text="Назад")],
+    ],
+    resize_keyboard=True,
+    input_field_placeholder="Нажми кнопку для оплаты заказа",
+)
+
+china_tariff_keyboard = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="Китай-Благовещенск-Керчь (2-5 дней до РФ, Владивостока)")],
+        [KeyboardButton(text="Китай-Москва-Керчь (20-30 дней до РФ, МСК)")],
+        [KeyboardButton(text="Назад")],
+    ],
+    resize_keyboard=True,
+    input_field_placeholder="Выбери тариф доставки",
 )
 
 info_keyboard = ReplyKeyboardMarkup(
@@ -180,6 +206,16 @@ admin_main_keyboard = ReplyKeyboardMarkup(
     input_field_placeholder="Напиши сообщение или выбери кнопку",
 )
 
+user_order_keyboard = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="Китай")],
+        [KeyboardButton(text="Найти эту вещь в Китае")],
+        [KeyboardButton(text="Назад")],
+    ],
+    resize_keyboard=True,
+    input_field_placeholder="Выбери раздел",
+)
+
 
 def now_str() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -211,8 +247,14 @@ def init_db() -> None:
                 first_seen TEXT NOT NULL DEFAULT '',
                 last_seen TEXT NOT NULL DEFAULT '',
                 country TEXT NOT NULL DEFAULT '',
+                tariff TEXT NOT NULL DEFAULT '',
                 status TEXT NOT NULL DEFAULT '',
                 note TEXT NOT NULL DEFAULT '',
+                discount INTEGER NOT NULL DEFAULT 0,
+                buyout_free INTEGER NOT NULL DEFAULT 0,
+                is_banned INTEGER NOT NULL DEFAULT 0,
+                ban_reason TEXT NOT NULL DEFAULT '',
+                payment_status TEXT NOT NULL DEFAULT '',
                 search_access INTEGER NOT NULL DEFAULT 0,
                 order_number INTEGER NOT NULL DEFAULT 0,
                 tracking_code TEXT NOT NULL DEFAULT '',
@@ -234,6 +276,30 @@ def init_db() -> None:
         if "search_access" not in columns:
             connection.execute(
                 "ALTER TABLE users ADD COLUMN search_access INTEGER NOT NULL DEFAULT 0"
+            )
+        if "tariff" not in columns:
+            connection.execute(
+                "ALTER TABLE users ADD COLUMN tariff TEXT NOT NULL DEFAULT ''"
+            )
+        if "discount" not in columns:
+            connection.execute(
+                "ALTER TABLE users ADD COLUMN discount INTEGER NOT NULL DEFAULT 0"
+            )
+        if "buyout_free" not in columns:
+            connection.execute(
+                "ALTER TABLE users ADD COLUMN buyout_free INTEGER NOT NULL DEFAULT 0"
+            )
+        if "is_banned" not in columns:
+            connection.execute(
+                "ALTER TABLE users ADD COLUMN is_banned INTEGER NOT NULL DEFAULT 0"
+            )
+        if "ban_reason" not in columns:
+            connection.execute(
+                "ALTER TABLE users ADD COLUMN ban_reason TEXT NOT NULL DEFAULT ''"
+            )
+        if "payment_status" not in columns:
+            connection.execute(
+                "ALTER TABLE users ADD COLUMN payment_status TEXT NOT NULL DEFAULT ''"
             )
 
 
@@ -268,6 +334,118 @@ def set_yuan_rate(value: str) -> None:
     set_setting("yuan_rate", value)
 
 
+def ensure_cargo_dirs() -> None:
+    CARGO_ORDERS_DIR.mkdir(parents=True, exist_ok=True)
+    CARGO_PHOTOS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def get_active_cargo_file() -> Path | None:
+    raw = get_setting("active_cargo_file", "").strip()
+    if not raw:
+        return None
+    path = Path(raw)
+    return path if path.exists() else None
+
+
+def set_active_cargo_file(path: Path | None) -> None:
+    set_setting("active_cargo_file", str(path) if path else "")
+
+
+def list_cargo_files() -> list[Path]:
+    ensure_cargo_dirs()
+    return sorted(CARGO_ORDERS_DIR.glob("*.xlsx"), key=lambda item: item.stat().st_mtime, reverse=True)
+
+
+def create_cargo_file() -> Path:
+    ensure_cargo_dirs()
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"cargo_{timestamp}.xlsx"
+    target = CARGO_ORDERS_DIR / filename
+    shutil.copy2(CARGO_TEMPLATE, target)
+    set_active_cargo_file(target)
+    return target
+
+
+def resolve_cargo_file(value: str | None) -> Path | None:
+    ensure_cargo_dirs()
+    target = (value or "current").strip()
+    if not target or target.lower() == "current":
+        return get_active_cargo_file()
+    files = list_cargo_files()
+    if target.isdigit():
+        index = int(target) - 1
+        if 0 <= index < len(files):
+            return files[index]
+        return None
+    path = CARGO_ORDERS_DIR / target
+    return path if path.exists() else None
+
+
+def get_cargo_next_row(sheet) -> int:
+    row = 5
+    while sheet[f"C{row}"].value or sheet[f"D{row}"].value or sheet[f"E{row}"].value:
+        row += 1
+    return row
+
+
+def append_product_to_cargo(file_path: Path, product: dict) -> int:
+    workbook = load_workbook(file_path)
+    sheet = workbook.active
+    row = get_cargo_next_row(sheet)
+    sheet[f"C{row}"] = product.get("name", "")
+    sheet[f"D{row}"] = product.get("link", "")
+    sheet[f"E{row}"] = f"Размер: {product.get('size', '')}\nЦвет: {product.get('color', '')}"
+    sheet[f"F{row}"] = product.get("price", "")
+    sheet[f"G{row}"] = product.get("quantity", "")
+    try:
+        price = float(str(product.get("price", "0")).replace(",", "."))
+        quantity = float(str(product.get("quantity", "0")).replace(",", "."))
+        sheet[f"H{row}"] = price * quantity
+    except ValueError:
+        sheet[f"H{row}"] = ""
+    sheet[f"I{row}"] = product.get("delivery", "")
+    if product.get("photo_path"):
+        try:
+            image = XLImage(str(product["photo_path"]))
+            image.width = 90
+            image.height = 90
+            sheet.add_image(image, f"J{row}")
+        except Exception:
+            pass
+    workbook.save(file_path)
+    return row
+
+
+def read_cargo_rows(file_path: Path) -> list[dict]:
+    workbook = load_workbook(file_path)
+    sheet = workbook.active
+    rows: list[dict] = []
+    row = 5
+    while row <= sheet.max_row:
+        name = sheet[f"C{row}"].value
+        link = sheet[f"D{row}"].value
+        specs = sheet[f"E{row}"].value
+        price = sheet[f"F{row}"].value
+        quantity = sheet[f"G{row}"].value
+        total = sheet[f"H{row}"].value
+        delivery = sheet[f"I{row}"].value
+        if any(value not in (None, "") for value in [name, link, specs, price, quantity, total, delivery]):
+            rows.append(
+                {
+                    "row": row,
+                    "name": name or "",
+                    "link": link or "",
+                    "specs": specs or "",
+                    "price": price or "",
+                    "quantity": quantity or "",
+                    "total": total or "",
+                    "delivery": delivery or "",
+                }
+            )
+        row += 1
+    return rows
+
+
 def is_maintenance_mode() -> bool:
     return get_setting("maintenance_mode", "0") == "1"
 
@@ -285,8 +463,14 @@ def row_to_user(row: sqlite3.Row) -> dict:
         "first_seen": row["first_seen"] or "",
         "last_seen": row["last_seen"] or "",
         "country": row["country"] or "",
+        "tariff": row["tariff"] if "tariff" in row.keys() else "",
         "status": row["status"] or "",
         "note": row["note"] or "",
+        "discount": int(row["discount"] or 0) if "discount" in row.keys() else 0,
+        "buyout_free": int(row["buyout_free"] or 0) if "buyout_free" in row.keys() else 0,
+        "is_banned": int(row["is_banned"] or 0) if "is_banned" in row.keys() else 0,
+        "ban_reason": row["ban_reason"] if "ban_reason" in row.keys() else "",
+        "payment_status": row["payment_status"] if "payment_status" in row.keys() else "",
         "search_access": int(row["search_access"] or 0),
         "order_number": int(row["order_number"] or 0),
         "tracking_code": row["tracking_code"] or "",
@@ -325,9 +509,10 @@ def migrate_legacy_users() -> None:
                 """
                 INSERT OR REPLACE INTO users (
                     id, first_name, last_name, username,
-                    first_seen, last_seen, country, status,
-                    note, search_access, order_number, tracking_code, tracking_stage
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    first_seen, last_seen, country, tariff, status,
+                    note, discount, buyout_free, is_banned, ban_reason, payment_status,
+                    search_access, order_number, tracking_code, tracking_stage
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     user_id,
@@ -337,8 +522,14 @@ def migrate_legacy_users() -> None:
                     raw_user.get("first_seen", "") or now_str(),
                     raw_user.get("last_seen", "") or now_str(),
                     raw_user.get("country", "") or "",
+                    raw_user.get("tariff", "") or "",
                     raw_user.get("status", "Новый") or "Новый",
                     raw_user.get("note", "") or "",
+                    int(raw_user.get("discount", 0) or 0),
+                    int(raw_user.get("buyout_free", 0) or 0),
+                    int(raw_user.get("is_banned", 0) or 0),
+                    raw_user.get("ban_reason", "") or "",
+                    raw_user.get("payment_status", "") or "",
                     int(raw_user.get("search_access", 0) or 0),
                     int(raw_user.get("order_number", 0) or 0),
                     raw_user.get("tracking_code", "") or "",
@@ -371,9 +562,10 @@ def save_users(users: dict[str, dict]) -> None:
                 """
                 INSERT INTO users (
                     id, first_name, last_name, username,
-                    first_seen, last_seen, country, status,
-                    note, search_access, order_number, tracking_code, tracking_stage
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    first_seen, last_seen, country, tariff, status,
+                    note, discount, buyout_free, is_banned, ban_reason, payment_status,
+                    search_access, order_number, tracking_code, tracking_stage
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     first_name=excluded.first_name,
                     last_name=excluded.last_name,
@@ -381,8 +573,14 @@ def save_users(users: dict[str, dict]) -> None:
                     first_seen=excluded.first_seen,
                     last_seen=excluded.last_seen,
                     country=excluded.country,
+                    tariff=excluded.tariff,
                     status=excluded.status,
                     note=excluded.note,
+                    discount=excluded.discount,
+                    buyout_free=excluded.buyout_free,
+                    is_banned=excluded.is_banned,
+                    ban_reason=excluded.ban_reason,
+                    payment_status=excluded.payment_status,
                     search_access=excluded.search_access,
                     order_number=excluded.order_number,
                     tracking_code=excluded.tracking_code,
@@ -396,8 +594,14 @@ def save_users(users: dict[str, dict]) -> None:
                     user.get("first_seen", "") or now_str(),
                     user.get("last_seen", "") or now_str(),
                     user.get("country", "") or "",
+                    user.get("tariff", "") or "",
                     user.get("status", "Новый") or "Новый",
                     user.get("note", "") or "",
+                    int(user.get("discount", 0) or 0),
+                    int(user.get("buyout_free", 0) or 0),
+                    int(user.get("is_banned", 0) or 0),
+                    user.get("ban_reason", "") or "",
+                    user.get("payment_status", "") or "",
                     int(user.get("search_access", 0) or 0),
                     int(user.get("order_number", 0) or 0),
                     user.get("tracking_code", "") or "",
@@ -409,6 +613,7 @@ def update_user(
     message: Message,
     *,
     country: str | None = None,
+    tariff: str | None = None,
     status: str | None = None,
 ) -> dict | None:
     if not message.from_user:
@@ -426,8 +631,14 @@ def update_user(
         "first_seen": existing.get("first_seen", now_str()),
         "last_seen": now_str(),
         "country": country if country is not None else existing.get("country", ""),
+        "tariff": tariff if tariff is not None else existing.get("tariff", ""),
         "status": status if status is not None else existing.get("status", "Новый"),
         "note": existing.get("note", ""),
+        "discount": int(existing.get("discount", 0) or 0),
+        "buyout_free": int(existing.get("buyout_free", 0) or 0),
+        "is_banned": int(existing.get("is_banned", 0) or 0),
+        "ban_reason": existing.get("ban_reason", ""),
+        "payment_status": existing.get("payment_status", ""),
         "search_access": int(existing.get("search_access", 0) or 0),
         "order_number": existing.get("order_number", 0),
         "tracking_code": existing.get("tracking_code", ""),
@@ -441,6 +652,19 @@ def update_user(
 
 def get_user(user_id: int) -> dict | None:
     return load_users().get(str(user_id))
+
+
+def update_user_fields(user_id: int, **fields) -> dict | None:
+    users = load_users()
+    key = str(user_id)
+    if key not in users:
+        return None
+
+    for field, value in fields.items():
+        users[key][field] = value
+    users[key]["last_seen"] = now_str()
+    save_users(users)
+    return users[key]
 
 
 def get_user_by_tracking_code(tracking_code: str) -> tuple[str | None, dict | None]:
@@ -481,19 +705,22 @@ def set_user_note(user_id: int, note: str) -> bool:
     return True
 
 
+def get_banned_users() -> list[dict]:
+    return [user for user in load_users().values() if int(user.get("is_banned", 0) or 0) == 1]
+
+
 def assign_order_number(user_id: int) -> int | None:
     users = load_users()
     key = str(user_id)
     if key not in users:
         return None
 
-    existing_number = users[key].get("order_number", 0)
-    if existing_number:
-        return existing_number
-
     last_number = max((int(user.get("order_number", 0)) for user in users.values()), default=0)
     new_number = last_number + 1
     users[key]["order_number"] = new_number
+    users[key]["tracking_code"] = ""
+    users[key]["tracking_stage"] = ""
+    users[key]["payment_status"] = ""
     users[key]["last_seen"] = now_str()
     save_users(users)
     return new_number
@@ -680,12 +907,20 @@ def format_order_card(user: dict, *, include_action_hint: bool = False) -> str:
         f"Имя: {full_name}",
         f"Username: {username}",
         f"Страна: {user.get('country', '') or 'Не выбрана'}",
+        f"Тариф: {user.get('tariff', '') or 'Не выбран'}",
         f"Статус: {user.get('status', '') or 'Новый'}",
+        f"Скидка: {int(user.get('discount', 0) or 0)}%",
+        f"Выкуп без комиссии: {'Да' if int(user.get('buyout_free', 0) or 0) == 1 else 'Нет'}",
+        f"Бан: {'Да' if int(user.get('is_banned', 0) or 0) == 1 else 'Нет'}",
         f"Попыток поиска: {int(user.get('search_access', 0) or 0)}",
         f"Трек-код: {user.get('tracking_code', '') or 'Нет'}",
         f"Этап: {user.get('tracking_stage', '') or 'Нет'}",
         f"Обновлен: {user.get('last_seen', '-')}",
     ]
+    if user.get("ban_reason"):
+        lines.append(f"Причина бана: {user['ban_reason']}")
+    if user.get("payment_status"):
+        lines.append(f"Оплата: {user['payment_status']}")
 
     if include_action_hint and user.get("status") in {"Заявка отправлена", "Отправляет данные"}:
         lines.append(f"Для одобрения: /done {user['id']}")
@@ -786,6 +1021,19 @@ async def maintenance_guard(message: Message) -> bool:
         return False
 
     await message.answer("Бот временно находится на техобслуживании. Попробуй написать позже.")
+    return True
+
+
+async def banned_guard(message: Message) -> bool:
+    if is_admin(message) or not message.from_user:
+        return False
+
+    user = get_user(message.from_user.id)
+    if not user or int(user.get("is_banned", 0) or 0) != 1:
+        return False
+
+    reason = user.get("ban_reason", "") or "без указания причины"
+    await message.answer(f"Ты заблокирован в боте.\nПричина: {reason}")
     return True
 
 
@@ -922,7 +1170,7 @@ async def send_main_menu(message: Message, user_name: str) -> None:
     await send_photo_or_text(
         message,
         WELCOME_IMAGE,
-        f"Привет, {user_name}! Это бот для заказа вещей из разных стран. Выбери нужный раздел в меню ниже:",
+        f"Привет, {user_name}! Это бот для заказа вещей из разных стран.\nВыбери нужный раздел в меню ниже:",
         reply_markup=current_main_keyboard(message),
     )
 
@@ -931,14 +1179,19 @@ async def notify_admin(bot: Bot, message: Message) -> None:
     if not message.from_user or message.from_user.id == ADMIN_ID:
         return
 
+    user = get_user(message.from_user.id) or {}
     username = f"@{message.from_user.username}" if message.from_user.username else "без username"
     text = message.text or message.caption or "[не текстовое сообщение]"
+    tariff_line = ""
+    if user.get("tariff"):
+        tariff_line = f"Тариф: {user['tariff']}\n"
     await bot.send_message(
         ADMIN_ID,
         "Новые данные по заказу:\n\n"
         f"ID: {message.from_user.id}\n"
         f"Имя: {message.from_user.full_name}\n"
         f"Username: {username}\n"
+        f"{tariff_line}"
         f"Текст: {text}\n\n"
         "Чтобы ответить, используй:\n"
         "/send user_id текст\n"
@@ -1029,6 +1282,8 @@ async def search_item_in_sources(query: str) -> list[dict]:
 async def cmd_start(message: Message) -> None:
     if await maintenance_guard(message):
         return
+    if await banned_guard(message):
+        return
     if is_rate_limited(message):
         await maybe_send_rate_limit_notice(message)
         return
@@ -1040,6 +1295,8 @@ async def cmd_start(message: Message) -> None:
 @dp.message(Command("help"))
 async def cmd_help(message: Message) -> None:
     if await maintenance_guard(message):
+        return
+    if await banned_guard(message):
         return
     if is_rate_limited(message):
         await maybe_send_rate_limit_notice(message)
@@ -1062,6 +1319,69 @@ async def cmd_help(message: Message) -> None:
 @dp.message(Command("admin"))
 async def admin_panel(message: Message) -> None:
     update_user(message)
+    if is_admin(message):
+        await message.answer(
+            "Админ-панель:\n\n"
+            f"Техобслуживание: {'включено' if is_maintenance_mode() else 'выключено'}\n\n"
+            "Кнопка 'Оформить заказ' - добавить товар в Excel пошагово\n"
+            "/users - список пользователей\n"
+            "/orders - все заказы и их статусы\n"
+            "/active - только активные заказы\n"
+            "/tracks - заказы с трек-кодами\n"
+            "/orderno номер - найти заказ по номеру\n"
+            "/today - короткая сводка за сегодня\n"
+            "/recent - последние 10 пользователей\n"
+            "/search запрос - поиск по пользователям и заказам\n"
+            "/grantsearch user_id [кол-во] - выдать попытки поиска\n"
+            "/setsearch user_id кол-во - выставить точное число попыток\n"
+            "/revokesearch user_id - удалить все попытки поиска\n"
+            "/searchlist - у кого есть попытки поиска\n"
+            "/user user_id - карточка пользователя\n"
+            "/owner код - узнать владельца трек-кода\n"
+            "/status user_id текст - вручную сменить статус\n"
+            "/stats - статистика по боту\n"
+            "/dashboard - быстрый дашборд по боту\n"
+            "/discount user_id процент - выдать скидку\n"
+            "/discountoff user_id - убрать скидку\n"
+            "/buyoutfree user_id - включить выкуп без комиссии\n"
+            "/buyoutfee user_id - отключить выкуп без комиссии\n"
+            "/note user_id текст - заметка по пользователю\n"
+            "/clearnote user_id - очистить заметку\n"
+            "/ban user_id причина - забанить пользователя\n"
+            "/unban user_id - разбанить пользователя\n"
+            "/banned - список забаненных пользователей\n"
+            "/payreq user_id реквизиты - отправить реквизиты на оплату\n"
+            "/paid user_id - отметить оплату как подтвержденную\n"
+            "/send user_id текст - отправить сообщение пользователю\n"
+            "/broadcast текст - отправить сообщение всем пользователям\n"
+            "/maintenance on|off - включить или выключить техобслуживание\n"
+            "/setyuan 12,0 - изменить курс юаня\n"
+            "/randomuser - случайный пользователь\n"
+            "/adminfun - случайная админ-фраза\n"
+            "/done user_id - обработать заказ и выдать трек-код\n"
+            "/cancel user_id - отменить заказ клиента\n"
+            "/track код - посмотреть этап заказа\n"
+            "/trackset код этап - изменить этап заказа\n"
+            "/vykup код - быстро поставить этап 'Выкуплен'\n"
+            "/sklad код - быстро поставить этап 'Приехал на склад'\n"
+            "/otpravlen код - быстро поставить этап 'Отправлен'\n"
+            "/rf код - быстро поставить этап 'Приехал в РФ'\n"
+            "/find текст - поиск вещи по твоим ссылкам\n"
+            "/excelsend [номер|имя|current] - отправить таблицу файлом\n"
+            "/excelview [номер|имя|current] - показать содержимое таблицы\n"
+            "/exceldelete [номер|имя|current] - удалить таблицу\n"
+            "/exceledit [номер|имя|current] строка поле значение - изменить строку таблицы\n"
+            "/excelorder - добавить товар в текущую таблицу карго\n"
+            "/newexcelorder - начать новую таблицу карго\n"
+            "/messageorder - оформить заказ и отправить его одним сообщением\n"
+            "/excelfiles - показать все таблицы карго\n"
+            "/activeexcel - показать текущую активную таблицу\n"
+            "/setactiveexcel [номер|имя] - сделать таблицу текущей\n"
+            "/closeexcel - закрыть текущую активную таблицу\n"
+            "/cargostats - короткая сводка по таблицам карго\n"
+            "/admin - показать все админ-команды"
+        )
+        return
     if not is_admin(message):
         await message.answer("У тебя нет доступа к админ-панели.")
         return
@@ -1527,7 +1847,13 @@ async def admin_user_card(message: Message) -> None:
         f"Дата первого входа: {user.get('first_seen', '-')}\n"
         f"Последняя активность: {user.get('last_seen', '-')}\n"
         f"Страна: {user.get('country', '') or 'Не выбрана'}\n"
+        f"Тариф: {user.get('tariff', '') or 'Не выбран'}\n"
         f"Статус: {user.get('status', '') or 'Новый'}\n"
+        f"Скидка: {int(user.get('discount', 0) or 0)}%\n"
+        f"Выкуп без комиссии: {'Да' if int(user.get('buyout_free', 0) or 0) == 1 else 'Нет'}\n"
+        f"Забанен: {'Да' if int(user.get('is_banned', 0) or 0) == 1 else 'Нет'}\n"
+        f"Причина бана: {user.get('ban_reason', '') or 'Нет'}\n"
+        f"Оплата: {user.get('payment_status', '') or 'Нет'}\n"
         f"Попыток поиска: {int(user.get('search_access', 0) or 0)}\n"
         f"Трек-код: {user.get('tracking_code', '') or 'Нет'}\n"
         f"Этап доставки: {user.get('tracking_stage', '') or 'Нет'}\n"
@@ -1823,17 +2149,24 @@ async def send_done_message(message: Message, bot: Bot) -> None:
 
     try:
         tracking_code = assign_tracking_code(user_id)
-        set_user_status(user_id, "Заказ обработан")
         await bot.send_message(
             user_id,
-            "Ваш заказ обработан.\n"
-            f"Ваш код для отслеживания заказа: {tracking_code}\n"
-            f"Текущий этап: {TRACKING_STAGES['1']}"
+            "Ваш заказ подтвержден.\n"
+            "Теперь можно перейти к оплате.\n"
+            "Нажми кнопку 'Оплатить заказ', чтобы запросить реквизиты.",
+            reply_markup=payment_keyboard,
+        )
+        update_user_fields(
+            user_id,
+            status="Ожидает оплату",
+            payment_status="approved_waiting_payment",
+            tracking_code=tracking_code,
+            tracking_stage=TRACKING_STAGES["1"],
         )
         await message.answer(
-            f"Заказ обработан.\n"
-            f"Код: {tracking_code}\n"
-            f"Пользователь: {user_id}"
+            "Заказ подтвержден и переведен в оплату.\n"
+            f"Пользователь: {user_id}\n"
+            f"Трек-код уже создан: {tracking_code}"
         )
     except Exception as error:
         await message.answer(f"Не удалось отправить сообщение: {error}")
@@ -1895,6 +2228,481 @@ async def cancel_order(message: Message, bot: Bot) -> None:
     )
 
 
+@dp.message(Command("dashboard"))
+async def admin_dashboard(message: Message) -> None:
+    if not is_admin(message):
+        await message.answer("У тебя нет доступа к этой команде.")
+        return
+
+    users = load_users()
+    await message.answer(
+        "Дашборд:\n\n"
+        f"Пользователей: {len(users)}\n"
+        f"Активных заказов: {sum(1 for user in users.values() if user.get('status') in ACTIVE_ORDER_STATUSES)}\n"
+        f"Забаненных: {sum(1 for user in users.values() if int(user.get('is_banned', 0) or 0) == 1)}\n"
+        f"Со скидкой: {sum(1 for user in users.values() if int(user.get('discount', 0) or 0) > 0)}\n"
+        f"Выкуп без комиссии: {sum(1 for user in users.values() if int(user.get('buyout_free', 0) or 0) == 1)}\n"
+        f"Ожидают оплату: {sum(1 for user in users.values() if (user.get('payment_status', '') or '') == 'waiting_payment')}\n"
+        f"Оплачено: {sum(1 for user in users.values() if (user.get('payment_status', '') or '') == 'paid')}"
+    )
+
+
+@dp.message(Command("discount"))
+async def admin_discount(message: Message, bot: Bot) -> None:
+    if not is_admin(message):
+        await message.answer("У тебя нет доступа к этой команде.")
+        return
+
+    parts = (message.text or "").split(maxsplit=2)
+    if len(parts) < 3:
+        await message.answer("Используй формат: /discount user_id процент")
+        return
+    try:
+        user_id = int(parts[1].strip())
+        percent = int(parts[2].strip())
+    except ValueError:
+        await message.answer("user_id и процент должны быть числами.")
+        return
+    if percent < 0 or percent > 100:
+        await message.answer("Процент скидки должен быть от 0 до 100.")
+        return
+
+    user = update_user_fields(user_id, discount=percent)
+    if not user:
+        await message.answer("Пользователь не найден.")
+        return
+    try:
+        await bot.send_message(user_id, f"Тебе выдана скидка {percent}%.")
+    except Exception:
+        pass
+    await message.answer(f"Пользователю {user_id} выдана скидка {percent}%.")
+
+
+@dp.message(Command("discountoff"))
+async def admin_discount_off(message: Message, bot: Bot) -> None:
+    if not is_admin(message):
+        await message.answer("У тебя нет доступа к этой команде.")
+        return
+
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer("Используй формат: /discountoff user_id")
+        return
+    try:
+        user_id = int(parts[1].strip())
+    except ValueError:
+        await message.answer("user_id должен быть числом.")
+        return
+
+    user = update_user_fields(user_id, discount=0)
+    if not user:
+        await message.answer("Пользователь не найден.")
+        return
+    try:
+        await bot.send_message(user_id, "Твоя скидка отключена.")
+    except Exception:
+        pass
+    await message.answer(f"Скидка у пользователя {user_id} отключена.")
+
+
+@dp.message(Command("buyoutfree"))
+async def admin_buyout_free(message: Message, bot: Bot) -> None:
+    if not is_admin(message):
+        await message.answer("У тебя нет доступа к этой команде.")
+        return
+
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer("Используй формат: /buyoutfree user_id")
+        return
+    try:
+        user_id = int(parts[1].strip())
+    except ValueError:
+        await message.answer("user_id должен быть числом.")
+        return
+
+    user = update_user_fields(user_id, buyout_free=1)
+    if not user:
+        await message.answer("Пользователь не найден.")
+        return
+    try:
+        await bot.send_message(user_id, "Тебе включен выкуп без комиссии.")
+    except Exception:
+        pass
+    await message.answer(f"Пользователю {user_id} включен выкуп без комиссии.")
+
+
+@dp.message(Command("buyoutfee"))
+async def admin_buyout_fee(message: Message, bot: Bot) -> None:
+    if not is_admin(message):
+        await message.answer("У тебя нет доступа к этой команде.")
+        return
+
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer("Используй формат: /buyoutfee user_id")
+        return
+    try:
+        user_id = int(parts[1].strip())
+    except ValueError:
+        await message.answer("user_id должен быть числом.")
+        return
+
+    user = update_user_fields(user_id, buyout_free=0)
+    if not user:
+        await message.answer("Пользователь не найден.")
+        return
+    try:
+        await bot.send_message(user_id, "Выкуп без комиссии отключен.")
+    except Exception:
+        pass
+    await message.answer(f"У пользователя {user_id} отключен выкуп без комиссии.")
+
+
+@dp.message(Command("ban"))
+async def admin_ban(message: Message, bot: Bot) -> None:
+    if not is_admin(message):
+        await message.answer("У тебя нет доступа к этой команде.")
+        return
+
+    parts = (message.text or "").split(maxsplit=2)
+    if len(parts) < 3:
+        await message.answer("Используй формат: /ban user_id причина")
+        return
+    try:
+        user_id = int(parts[1].strip())
+    except ValueError:
+        await message.answer("user_id должен быть числом.")
+        return
+
+    reason = parts[2].strip()
+    if not reason:
+        await message.answer("Причина бана не должна быть пустой.")
+        return
+
+    user = update_user_fields(user_id, is_banned=1, ban_reason=reason)
+    if not user:
+        await message.answer("Пользователь не найден.")
+        return
+    paid_search_users.discard(user_id)
+    admin_search_users.discard(user_id)
+    tracking_lookup_users.discard(user_id)
+    try:
+        await bot.send_message(user_id, f"Ты заблокирован в боте.\nПричина: {reason}")
+    except Exception:
+        pass
+    await message.answer(f"Пользователь {user_id} забанен.\nПричина: {reason}")
+
+
+@dp.message(Command("unban"))
+async def admin_unban(message: Message, bot: Bot) -> None:
+    if not is_admin(message):
+        await message.answer("У тебя нет доступа к этой команде.")
+        return
+
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer("Используй формат: /unban user_id")
+        return
+    try:
+        user_id = int(parts[1].strip())
+    except ValueError:
+        await message.answer("user_id должен быть числом.")
+        return
+
+    user = update_user_fields(user_id, is_banned=0, ban_reason="")
+    if not user:
+        await message.answer("Пользователь не найден.")
+        return
+    try:
+        await bot.send_message(user_id, "Ты разблокирован в боте.")
+    except Exception:
+        pass
+    await message.answer(f"Пользователь {user_id} разбанен.")
+
+
+@dp.message(Command("banned"))
+async def admin_banned(message: Message) -> None:
+    if not is_admin(message):
+        await message.answer("У тебя нет доступа к этой команде.")
+        return
+
+    users = get_banned_users()
+    if not users:
+        await message.answer("Список забаненных пуст.")
+        return
+    lines = [
+        f"{user['id']} | {' '.join(part for part in [user.get('first_name', ''), user.get('last_name', '')] if part).strip() or 'Без имени'}\n"
+        f"Причина: {user.get('ban_reason', '') or 'не указана'}"
+        for user in users
+    ]
+    await send_long_text(message, "Забаненные пользователи:\n\n" + "\n\n".join(lines))
+
+
+@dp.message(Command("payreq"))
+async def admin_payreq(message: Message, bot: Bot) -> None:
+    if not is_admin(message):
+        await message.answer("У тебя нет доступа к этой команде.")
+        return
+
+    parts = (message.text or "").split(maxsplit=2)
+    if len(parts) < 3:
+        await message.answer("Используй формат: /payreq user_id реквизиты")
+        return
+    try:
+        user_id = int(parts[1].strip())
+    except ValueError:
+        await message.answer("user_id должен быть числом.")
+        return
+
+    requisites = parts[2].strip()
+    if not requisites:
+        await message.answer("Реквизиты не должны быть пустыми.")
+        return
+
+    user = update_user_fields(user_id, payment_status="waiting_payment")
+    if not user:
+        await message.answer("Пользователь не найден.")
+        return
+    try:
+        await bot.send_message(
+            user_id,
+            "Реквизиты для оплаты:\n"
+            f"{requisites}\n\n"
+            "После оплаты отправь чек или подтверждение в бот."
+        )
+    except Exception as error:
+        await message.answer(f"Не удалось отправить реквизиты: {error}")
+        return
+    await message.answer(f"Реквизиты отправлены пользователю {user_id}.")
+
+
+@dp.message(Command("paid"))
+async def admin_paid(message: Message, bot: Bot) -> None:
+    if not is_admin(message):
+        await message.answer("У тебя нет доступа к этой команде.")
+        return
+
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer("Используй формат: /paid user_id")
+        return
+    try:
+        user_id = int(parts[1].strip())
+    except ValueError:
+        await message.answer("user_id должен быть числом.")
+        return
+
+    user = update_user_fields(user_id, payment_status="paid", status="Заказ обработан")
+    if not user:
+        await message.answer("Пользователь не найден.")
+        return
+    try:
+        tracking_code = user.get("tracking_code", "") or "пока не назначен"
+        await bot.send_message(
+            user_id,
+            "Оплата подтверждена. Спасибо!\n"
+            f"Твой трек-код: {tracking_code}\n"
+            f"Текущий этап: {user.get('tracking_stage', '') or TRACKING_STAGES['1']}",
+            reply_markup=current_main_keyboard(message),
+        )
+    except Exception:
+        pass
+    await message.answer(f"Оплата пользователя {user_id} подтверждена.")
+
+
+@dp.message(Command("randomuser"))
+async def admin_random_user(message: Message) -> None:
+    if not is_admin(message):
+        await message.answer("У тебя нет доступа к этой команде.")
+        return
+
+    users = list(load_users().values())
+    if not users:
+        await message.answer("Пока нет пользователей.")
+        return
+    await message.answer("Случайный пользователь:\n\n" + format_order_card(secrets.choice(users)))
+
+
+@dp.message(Command("adminfun"))
+async def admin_fun(message: Message) -> None:
+    if not is_admin(message):
+        await message.answer("У тебя нет доступа к этой команде.")
+        return
+
+    phrases = [
+        "Админ в потоке. Бот под контролем.",
+        "Все спокойно, заказы дышат ровно.",
+        "Панель управления сегодня особенно послушная.",
+        "Склад мысленно уже собран и отправлен.",
+        "Работаем красиво и без суеты.",
+    ]
+    await message.answer(secrets.choice(phrases))
+
+
+@dp.message(Command("excelorder"))
+async def admin_excel_order(message: Message) -> None:
+    if not is_admin(message):
+        await message.answer("У тебя нет доступа к этой команде.")
+        return
+    ensure_cargo_dirs()
+    file_path = get_active_cargo_file() or create_cargo_file()
+    set_active_cargo_file(file_path)
+    admin_excel_sessions[message.from_user.id] = {
+        "mode": "excel_order",
+        "step": "photo",
+        "file_path": file_path,
+        "data": {},
+    }
+    await message.answer(
+        f"Добавляем товар в таблицу {file_path.name}.\n"
+        "Отправь фото товара."
+    )
+
+
+@dp.message(Command("newexcelorder"))
+async def admin_new_excel_order(message: Message) -> None:
+    if not is_admin(message):
+        await message.answer("У тебя нет доступа к этой команде.")
+        return
+    ensure_cargo_dirs()
+    file_path = create_cargo_file()
+    admin_excel_sessions[message.from_user.id] = {
+        "mode": "excel_order",
+        "step": "photo",
+        "file_path": file_path,
+        "data": {},
+    }
+    await message.answer(
+        f"Создана новая таблица {file_path.name}.\n"
+        "Отправь фото товара."
+    )
+
+
+@dp.message(Command("excelfiles"))
+async def admin_excel_files(message: Message) -> None:
+    if not is_admin(message):
+        await message.answer("У тебя нет доступа к этой команде.")
+        return
+    files = list_cargo_files()
+    if not files:
+        await message.answer("Пока нет таблиц карго.")
+        return
+    active = get_active_cargo_file()
+    lines = []
+    for index, file_path in enumerate(files, start=1):
+        marker = " [active]" if active and active == file_path else ""
+        lines.append(f"{index}. {file_path.name}{marker}")
+    await message.answer("Таблицы карго:\n\n" + "\n".join(lines))
+
+
+@dp.message(Command("activeexcel"))
+async def admin_active_excel(message: Message) -> None:
+    if not is_admin(message):
+        await message.answer("У тебя нет доступа к этой команде.")
+        return
+    active = get_active_cargo_file()
+    if not active:
+        await message.answer("Сейчас нет активной таблицы.")
+        return
+    await message.answer(f"Текущая активная таблица: {active.name}")
+
+
+@dp.message(Command("excelsend"))
+async def admin_excel_send(message: Message) -> None:
+    if not is_admin(message):
+        await message.answer("У тебя нет доступа к этой команде.")
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    file_path = resolve_cargo_file(parts[1] if len(parts) > 1 else "current")
+    if not file_path:
+        await message.answer("Таблица не найдена.")
+        return
+    await message.answer_document(FSInputFile(str(file_path)))
+
+
+@dp.message(Command("excelview"))
+async def admin_excel_view(message: Message) -> None:
+    if not is_admin(message):
+        await message.answer("У тебя нет доступа к этой команде.")
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    file_path = resolve_cargo_file(parts[1] if len(parts) > 1 else "current")
+    if not file_path:
+        await message.answer("Таблица не найдена.")
+        return
+    rows = read_cargo_rows(file_path)
+    if not rows:
+        await message.answer(f"В таблице {file_path.name} пока нет товаров.")
+        return
+    lines = [f"Таблица: {file_path.name}"]
+    for item in rows:
+        lines.append(
+            f"Строка {item['row']}: {item['name']}\n"
+            f"Ссылка: {item['link'] or '-'}\n"
+            f"Характеристики: {item['specs'] or '-'}\n"
+            f"Цена: {item['price'] or '-'} | Кол-во: {item['quantity'] or '-'} | Итого: {item['total'] or '-'}\n"
+            f"Доставка: {item['delivery'] or '-'}"
+        )
+    await send_long_text(message, "\n\n".join(lines))
+
+
+@dp.message(Command("exceldelete"))
+async def admin_excel_delete(message: Message) -> None:
+    if not is_admin(message):
+        await message.answer("У тебя нет доступа к этой команде.")
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    file_path = resolve_cargo_file(parts[1] if len(parts) > 1 else "current")
+    if not file_path:
+        await message.answer("Таблица не найдена.")
+        return
+    if get_active_cargo_file() == file_path:
+        set_active_cargo_file(None)
+    file_path.unlink(missing_ok=True)
+    await message.answer(f"Таблица {file_path.name} удалена.")
+
+
+@dp.message(Command("exceledit"))
+async def admin_excel_edit(message: Message) -> None:
+    if not is_admin(message):
+        await message.answer("У тебя нет доступа к этой команде.")
+        return
+    parts = (message.text or "").split(maxsplit=4)
+    if len(parts) < 5:
+        await message.answer("Используй формат: /exceledit [номер|имя|current] строка поле значение")
+        return
+    file_path = resolve_cargo_file(parts[1])
+    if not file_path:
+        await message.answer("Таблица не найдена.")
+        return
+    try:
+        row = int(parts[2].strip())
+    except ValueError:
+        await message.answer("Строка должна быть числом.")
+        return
+    field = parts[3].strip().lower()
+    value = parts[4].strip()
+    column_map = {
+        "name": "C",
+        "link": "D",
+        "specs": "E",
+        "price": "F",
+        "quantity": "G",
+        "total": "H",
+        "delivery": "I",
+    }
+    column = column_map.get(field)
+    if not column:
+        await message.answer("Поле должно быть одним из: name, link, specs, price, quantity, total, delivery")
+        return
+    workbook = load_workbook(file_path)
+    sheet = workbook.active
+    sheet[f"{column}{row}"] = value
+    workbook.save(file_path)
+    await message.answer(f"Таблица {file_path.name}: строка {row}, поле {field} обновлено.")
+
+
 @dp.message(F.text == "Неодобренные заказы")
 async def pending_orders_button(message: Message) -> None:
     if not is_admin(message):
@@ -1926,6 +2734,8 @@ async def all_orders_button(message: Message) -> None:
 @dp.message(F.text == "Сделать заказ")
 async def make_order(message: Message) -> None:
     if await maintenance_guard(message):
+        return
+    if await banned_guard(message):
         return
     if is_rate_limited(message):
         await maybe_send_rate_limit_notice(message)
@@ -1995,6 +2805,17 @@ async def tariffs(message: Message) -> None:
     await send_photo_or_text(
         message,
         TARIFF_IMAGE,
+        "НАШ ТАРИФ, что он включает?!\n"
+        "он включает два вида доставки\n\n"
+        "1.Китай-Благовещенск-Керчь\n"
+        "2.Китай-Москва-Керчь\n\n"
+        "Ценник фиксированный - 6$ за кг\n\n"
+        "ДОСТАВКА СДЭК ОПЛАЧИВАЕТСЯ ОТДЕЛЬНО",
+    )
+    return
+    await send_photo_or_text(
+        message,
+        TARIFF_IMAGE,
         "Пока что существует 1 единственный тариф, это 20-30 дней "
         "с момента отправки со склада - 6 долларов за кг",
     )
@@ -2021,7 +2842,7 @@ async def set_yuan_rate_command(message: Message) -> None:
 
     display_value = raw_input.replace(".", ",")
     set_yuan_rate(display_value)
-    await message.answer(f"Курс юаня обновлён: {display_value}")
+    await message.answer(f"Курс юаня обновлен: {display_value}")
 
 
 @dp.message(F.text == "Курс юаня")
@@ -2051,10 +2872,9 @@ async def info(message: Message) -> None:
     await send_photo_or_text(
         message,
         INFO_IMAGE,
-        "Фотоотчет отправляется прямо в бот\n" 
-        "время работы бота 8 00 - 20 00(временно)\n" 
-        "а также ты здесь можешь узнать статус заказа,\n"
-        "посмотреть свой заказ и остаток попыток поиска",
+        "Фотоотчет отправляется прямо в бот.\n"
+        "Время работы бота: 8:00 - 20:00 (временно).\n"
+        "Здесь ты можешь узнать статус заказа, посмотреть свой заказ и остаток попыток поиска.",
         reply_markup=info_keyboard,
     )
 
@@ -2091,6 +2911,7 @@ async def my_order(message: Message) -> None:
     await message.answer(
         "Твой заказ:\n\n"
         f"Номер заказа: {user.get('order_number', 0) or 'Еще не присвоен'}\n"
+        f"Тариф: {user.get('tariff', '') or 'Не выбран'}\n"
         f"Статус: {user.get('status', '') or 'Новый'}\n"
         f"Трек-код: {user.get('tracking_code', '') or 'Пока нет'}\n"
         f"Этап: {user.get('tracking_stage', '') or 'Пока не назначен'}",
@@ -2171,32 +2992,52 @@ async def china_order(message: Message, bot: Bot) -> None:
     if is_rate_limited(message):
         await maybe_send_rate_limit_notice(message)
         return
-    user = update_user(message, country="Китай", status="Оформляет заказ")
+    user = update_user(message, country="Китай", tariff="", status="Выбирает тариф")
     if not message.from_user or not user:
         return
 
-    china_order_users.add(message.from_user.id)
+    china_order_users.discard(message.from_user.id)
     tracking_lookup_users.discard(message.from_user.id)
     await message.answer(
-        "Тогда скидывай ссылку товара, фото товара, размер, цвет.",
-        reply_markup=china_submit_keyboard,
-    )
-    await bot.send_message(
-        ADMIN_ID,
-        f"Пользователь {message.from_user.full_name} "
-        f"(ID: {message.from_user.id}) начал заказ из Китая.",
+        "Выбери тариф доставки:",
+        reply_markup=china_tariff_keyboard,
     )
 
 
-@dp.message(F.text.in_(["Сша", "Корея"]))
-async def other_country_order(message: Message) -> None:
+@dp.message(F.text.in_([
+    "Китай-Благовещенск-Керчь (2-5 дней до РФ, Владивостока)",
+    "Китай-Москва-Керчь (20-30 дней до РФ, МСК)",
+]))
+async def select_china_tariff(message: Message, bot: Bot) -> None:
     if await maintenance_guard(message):
         return
     if is_rate_limited(message):
         await maybe_send_rate_limit_notice(message)
         return
-    update_user(message, country=message.text, status="Временно закрыто")
-    await message.answer("Временно закрыто.", reply_markup=current_main_keyboard(message))
+    if not message.from_user:
+        return
+
+    user = update_user(
+        message,
+        country="Китай",
+        tariff=message.text,
+        status="Оформляет заказ",
+    )
+    if not user:
+        return
+
+    china_order_users.add(message.from_user.id)
+    tracking_lookup_users.discard(message.from_user.id)
+    await message.answer(
+        "Теперь скидывай ссылку товара, фото товара, размер, цвет и остальные данные по заказу.",
+        reply_markup=china_submit_keyboard,
+    )
+    await bot.send_message(
+        ADMIN_ID,
+        f"Пользователь {message.from_user.full_name} "
+        f"(ID: {message.from_user.id}) начал заказ из Китая.\n"
+        f"Тариф: {message.text}",
+    )
 
 
 @dp.message(F.text == "Я все скинул")
@@ -2208,12 +3049,13 @@ async def finish_china_order(message: Message, bot: Bot) -> None:
         return
     if not message.from_user or message.from_user.id not in china_order_users:
         update_user(message)
-        await message.answer("Сначала выбери раздел 'Сделать заказ' и затем 'Китай'.")
+        await message.answer("Сначала выбери раздел 'Сделать заказ', затем 'Китай' и тариф доставки.")
         return
 
     order_number = assign_order_number(message.from_user.id)
-    update_user(message, country="Китай", status="Заявка отправлена")
+    user = update_user(message, country="Китай", status="Заявка отправлена")
     china_order_users.discard(message.from_user.id)
+    tariff = (user or {}).get("tariff", "") or "Не выбран"
     await message.answer(
         f"Готово, ожидайте. Ваш номер заказа: {order_number}",
         reply_markup=current_main_keyboard(message),
@@ -2222,7 +3064,36 @@ async def finish_china_order(message: Message, bot: Bot) -> None:
         ADMIN_ID,
         f"Заказ №{order_number}\n"
         f"Пользователь {message.from_user.full_name} "
-        f"(ID: {message.from_user.id}) завершил отправку данных по заказу из Китая.",
+        f"(ID: {message.from_user.id}) завершил отправку данных по заказу из Китая.\n"
+        f"Тариф: {tariff}",
+    )
+
+
+@dp.message(F.text == "Оплатить заказ")
+async def request_payment(message: Message, bot: Bot) -> None:
+    if await maintenance_guard(message):
+        return
+    if await banned_guard(message):
+        return
+    if is_rate_limited(message):
+        await maybe_send_rate_limit_notice(message)
+        return
+    if not message.from_user:
+        return
+
+    user = get_user(message.from_user.id)
+    if not user or (user.get("payment_status", "") or "") != "approved_waiting_payment":
+        await message.answer("Сейчас оплата для этого заказа недоступна.")
+        return
+
+    update_user_fields(message.from_user.id, payment_status="requested_requisites")
+    await message.answer("Запрос на оплату отправлен админу. Ожидай реквизиты.")
+    await bot.send_message(
+        ADMIN_ID,
+        f"Пользователь {message.from_user.full_name} "
+        f"(ID: {message.from_user.id}) запросил оплату.\n"
+        "Отправь реквизиты командой:\n"
+        f"/payreq {message.from_user.id} РЕКВИЗИТЫ"
     )
 
 
@@ -2233,8 +3104,9 @@ async def back_to_main_menu(message: Message) -> None:
     if is_rate_limited(message):
         await maybe_send_rate_limit_notice(message)
         return
-    update_user(message, status="В главном меню")
+    update_user(message, tariff="", status="В главном меню")
     if message.from_user:
+        admin_excel_sessions.pop(message.from_user.id, None)
         china_order_users.discard(message.from_user.id)
         admin_search_users.discard(message.from_user.id)
         paid_search_users.discard(message.from_user.id)
@@ -2247,6 +3119,8 @@ async def back_to_main_menu(message: Message) -> None:
 async def handle_messages(message: Message, bot: Bot) -> None:
     if await maintenance_guard(message):
         return
+    if await banned_guard(message):
+        return
     if is_rate_limited(message):
         await maybe_send_rate_limit_notice(message)
         return
@@ -2255,6 +3129,67 @@ async def handle_messages(message: Message, bot: Bot) -> None:
 
     if not message.from_user:
         return
+
+    session = admin_excel_sessions.get(message.from_user.id)
+    if is_admin(message) and session and session.get("mode") == "excel_order":
+        ensure_cargo_dirs()
+        step = session.get("step")
+        if step == "photo":
+            if not message.photo:
+                await message.answer("Отправь фото товара.")
+                return
+            photo = message.photo[-1]
+            photo_path = CARGO_PHOTOS_DIR / f"{message.from_user.id}_{int(time.time())}.jpg"
+            await bot.download(photo, destination=str(photo_path))
+            session["data"]["photo_path"] = photo_path
+            session["step"] = "name"
+            await message.answer("Теперь отправь название товара.")
+            return
+        if step == "name":
+            session["data"]["name"] = (message.text or "").strip()
+            session["step"] = "size"
+            await message.answer("Теперь отправь размер.")
+            return
+        if step == "size":
+            session["data"]["size"] = (message.text or "").strip()
+            session["step"] = "color"
+            await message.answer("Теперь отправь цвет.")
+            return
+        if step == "color":
+            session["data"]["color"] = (message.text or "").strip()
+            session["step"] = "link"
+            await message.answer("Теперь отправь ссылку на товар.")
+            return
+        if step == "link":
+            session["data"]["link"] = (message.text or "").strip()
+            session["step"] = "price"
+            await message.answer("Теперь отправь цену за единицу.")
+            return
+        if step == "price":
+            session["data"]["price"] = (message.text or "").strip()
+            session["step"] = "quantity"
+            await message.answer("Теперь отправь количество.")
+            return
+        if step == "quantity":
+            session["data"]["quantity"] = (message.text or "").strip()
+            session["step"] = "delivery"
+            await message.answer("Теперь отправь доставку по Китаю.")
+            return
+        if step == "delivery":
+            session["data"]["delivery"] = (message.text or "").strip()
+            row = append_product_to_cargo(session["file_path"], session["data"])
+            file_name = Path(session["file_path"]).name
+            admin_excel_sessions[message.from_user.id] = {
+                "mode": "excel_order",
+                "step": "photo",
+                "file_path": session["file_path"],
+                "data": {},
+            }
+            await message.answer(
+                f"Товар добавлен в {file_name}, строка {row}.\n"
+                "Можешь сразу отправить фото следующего товара или использовать /excelview current."
+            )
+            return
 
     if message.from_user.id in admin_search_users and is_admin(message):
         query = (message.text or message.caption or "").strip()
@@ -2326,6 +3261,18 @@ async def handle_messages(message: Message, bot: Bot) -> None:
         )
         return
 
+    current_user = get_user(message.from_user.id)
+    if current_user and (current_user.get("payment_status", "") or "") == "waiting_payment":
+        await bot.forward_message(ADMIN_ID, message.chat.id, message.message_id)
+        await bot.send_message(
+            ADMIN_ID,
+            f"Пользователь {message.from_user.full_name} "
+            f"(ID: {message.from_user.id}) отправил подтверждение оплаты.\n"
+            f"Подтверди оплату командой:\n/paid {message.from_user.id}"
+        )
+        await message.answer("Подтверждение оплаты отправлено админу. Ожидай проверку.")
+        return
+
     if is_admin(message):
         if message.text:
             await message.answer(
@@ -2369,6 +3316,7 @@ async def handle_messages(message: Message, bot: Bot) -> None:
 
 
 async def main() -> None:
+    ensure_cargo_dirs()
     init_db()
     migrate_legacy_users()
     purge_canceled_orders()
@@ -2378,3 +3326,4 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
+
