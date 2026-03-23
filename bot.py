@@ -30,6 +30,7 @@ ORDER_IMAGE = BASE_DIR / "strana.png"
 TARIFF_IMAGE = BASE_DIR / "tarif.png"
 SUPPORT_IMAGE = BASE_DIR / "teh.png"
 INFO_IMAGE = BASE_DIR / "info.png"
+YUAN_IMAGE = BASE_DIR / "kurs.png"
 SEARCH_SOURCES = [
     "https://www.goofish.com/",
     "https://mxjstore.x.yupoo.com/albums",
@@ -152,6 +153,34 @@ info_keyboard = ReplyKeyboardMarkup(
 )
 
 
+user_main_keyboard = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="Сделать заказ")],
+        [KeyboardButton(text="Тарифы")],
+        [KeyboardButton(text="Курс юаня")],
+        [KeyboardButton(text="Инфо")],
+        [KeyboardButton(text="Тех. поддержка")],
+    ],
+    resize_keyboard=True,
+    input_field_placeholder="Напиши сообщение или выбери кнопку",
+)
+
+admin_main_keyboard = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="Сделать заказ")],
+        [KeyboardButton(text="Найти эту вещь в Китае")],
+        [KeyboardButton(text="Неодобренные заказы")],
+        [KeyboardButton(text="Все заказы и их статусы")],
+        [KeyboardButton(text="Тарифы")],
+        [KeyboardButton(text="Курс юаня")],
+        [KeyboardButton(text="Инфо")],
+        [KeyboardButton(text="Тех. поддержка")],
+    ],
+    resize_keyboard=True,
+    input_field_placeholder="Напиши сообщение или выбери кнопку",
+)
+
+
 def now_str() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -229,6 +258,14 @@ def set_setting(key: str, value: str) -> None:
             """,
             (key, value),
         )
+
+
+def get_yuan_rate() -> str:
+    return get_setting("yuan_rate", "13,0")
+
+
+def set_yuan_rate(value: str) -> None:
+    set_setting("yuan_rate", value)
 
 
 def is_maintenance_mode() -> bool:
@@ -1960,6 +1997,45 @@ async def tariffs(message: Message) -> None:
         TARIFF_IMAGE,
         "Пока что существует 1 единственный тариф, это 20-30 дней "
         "с момента отправки со склада - 6 долларов за кг",
+    )
+
+
+@dp.message(Command("setyuan"))
+async def set_yuan_rate_command(message: Message) -> None:
+    if not is_admin(message):
+        await message.answer("У тебя нет доступа к этой команде.")
+        return
+
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        await message.answer("Используй формат: /setyuan 12,0")
+        return
+
+    raw_input = parts[1].strip()
+    numeric_value = raw_input.replace(",", ".")
+    try:
+        float(numeric_value)
+    except ValueError:
+        await message.answer("Курс должен быть числом, например 12,0 или 12.0")
+        return
+
+    display_value = raw_input.replace(".", ",")
+    set_yuan_rate(display_value)
+    await message.answer(f"Курс юаня обновлён: {display_value}")
+
+
+@dp.message(F.text == "Курс юаня")
+async def yuan_rate_tab(message: Message) -> None:
+    if await maintenance_guard(message):
+        return
+    if is_rate_limited(message):
+        await maybe_send_rate_limit_notice(message)
+        return
+    update_user(message)
+    await send_photo_or_text(
+        message,
+        YUAN_IMAGE,
+        f"Курс юаня {get_yuan_rate()}",
     )
 
 
