@@ -1,22 +1,19 @@
-﻿import asyncio
+import asyncio
 import json
 import logging
 import os
-import random
 import re
 import secrets
 import sqlite3
 import time
-from copy import copy
 from datetime import datetime
 from pathlib import Path
-from shutil import copy2
 from urllib.parse import urljoin
 
 import aiohttp
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
-from aiogram.types import BotCommand, BotCommandScopeChat, BotCommandScopeDefault, FSInputFile, KeyboardButton, Message, ReplyKeyboardMarkup
+from aiogram.types import FSInputFile, KeyboardButton, Message, ReplyKeyboardMarkup
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 
@@ -33,28 +30,6 @@ ORDER_IMAGE = BASE_DIR / "strana.png"
 TARIFF_IMAGE = BASE_DIR / "tarif.png"
 SUPPORT_IMAGE = BASE_DIR / "teh.png"
 INFO_IMAGE = BASE_DIR / "info.png"
-CARGO_TEMPLATE_XLSX = BASE_DIR / "каргос.xlsx"
-CARGO_ORDERS_DIR = BASE_DIR / "cargo_orders"
-CARGO_PHOTO_DIR = BASE_DIR / "cargo_photos"
-CARGO_SHEET_NAME = "Лист1"
-CARGO_START_ROW = 6
-CARGO_NAME_COLUMN = "C"
-CARGO_LINK_COLUMN = "D"
-CARGO_DETAILS_COLUMN = "E"
-CARGO_PRICE_COLUMN = "F"
-CARGO_QUANTITY_COLUMN = "G"
-CARGO_TOTAL_COLUMN = "H"
-CARGO_DELIVERY_COLUMN = "I"
-CARGO_PHOTO_COLUMN = "J"
-CARGO_IMAGE_WIDTH = 95
-CARGO_IMAGE_HEIGHT = 95
-ADMIN_FUN_QUOTES = [
-    "Сегодня бот слушается. Пользуйся моментом.",
-    "Админ-режим активирован. Кофе мысленно налит.",
-    "Все под контролем. Даже если таблица делает вид, что нет.",
-    "Иногда лучший фикс это просто открыть нужную таблицу с первого раза.",
-    "Бот работает. Магия и немного Python.",
-]
 SEARCH_SOURCES = [
     "https://www.goofish.com/",
     "https://mxjstore.x.yupoo.com/albums",
@@ -74,18 +49,6 @@ SEARCH_SOURCES = [
     "https://rainbowreps.x.yupoo.com/",
     "https://angelking47.x.yupoo.com/",
     "https://pikachushop.x.yupoo.com/",
-    "https://tiger-official.x.yupoo.com/",
-    "https://scorpio-reps.x.yupoo.com/",
-    "https://thethunder.x.yupoo.com/",
-    "https://1to1.x.yupoo.com/",
-    "https://madebykungfu.x.yupoo.com/",
-    "https://repsunofficial.x.yupoo.com/",
-    "https://dragonrep333.x.yupoo.com/",
-    "https://scarlettluxury.x.zhidian-inc.cn/",
-    "https://noghost.x.zhidian-inc.cn/",
-    "https://west42.x.yupoo.com/albums",
-    "https://summer-sneaker.x.yupoo.com/albums",
-    "https://407900329.x.yupoo.com/albums",
 ]
 HTTP_HEADERS = {
     "User-Agent": (
@@ -110,9 +73,6 @@ ACTIVE_ORDER_STATUSES = {
     "Оформляет заказ",
     "Отправляет данные",
     "Заявка отправлена",
-    "Ожидает оплату",
-    "Оплата на проверке",
-    "Оплачен",
     "Заказ обработан",
 }
 
@@ -130,11 +90,6 @@ china_order_users: set[int] = set()
 admin_search_users: set[int] = set()
 paid_search_users: set[int] = set()
 tracking_lookup_users: set[int] = set()
-support_users: set[int] = set()
-payment_users: set[int] = set()
-admin_cargo_order_states: dict[int, dict] = {}
-admin_cargo_active_workbooks: dict[int, str] = {}
-admin_message_order_states: dict[int, dict] = {}
 search_semaphore = asyncio.Semaphore(3)
 user_request_times: dict[int, list[float]] = {}
 user_last_limit_notice: dict[int, float] = {}
@@ -153,7 +108,6 @@ user_main_keyboard = ReplyKeyboardMarkup(
 admin_main_keyboard = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="Сделать заказ")],
-        [KeyboardButton(text="Оформить заказ")],
         [KeyboardButton(text="Найти эту вещь в Китае")],
         [KeyboardButton(text="Неодобренные заказы")],
         [KeyboardButton(text="Все заказы и их статусы")],
@@ -186,15 +140,6 @@ china_submit_keyboard = ReplyKeyboardMarkup(
     input_field_placeholder="Отправь данные по заказу или нажми кнопку ниже",
 )
 
-payment_keyboard = ReplyKeyboardMarkup(
-    keyboard=[
-        [KeyboardButton(text="Оплатить заказ")],
-        [KeyboardButton(text="Назад")],
-    ],
-    resize_keyboard=True,
-    input_field_placeholder="Нажми кнопку для отправки оплаты",
-)
-
 info_keyboard = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="Мой заказ")],
@@ -206,22 +151,9 @@ info_keyboard = ReplyKeyboardMarkup(
     input_field_placeholder="Выбери действие",
 )
 
-admin_cargo_order_keyboard = ReplyKeyboardMarkup(
-    keyboard=[
-        [KeyboardButton(text="Назад")],
-    ],
-    resize_keyboard=True,
-    input_field_placeholder="Отправь данные для таблицы или нажми 'Назад'",
-)
-
 
 def now_str() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-
-def ensure_storage_dirs() -> None:
-    CARGO_ORDERS_DIR.mkdir(parents=True, exist_ok=True)
-    CARGO_PHOTO_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def get_db() -> sqlite3.Connection:
@@ -255,9 +187,7 @@ def init_db() -> None:
                 search_access INTEGER NOT NULL DEFAULT 0,
                 order_number INTEGER NOT NULL DEFAULT 0,
                 tracking_code TEXT NOT NULL DEFAULT '',
-                tracking_stage TEXT NOT NULL DEFAULT '',
-                banned INTEGER NOT NULL DEFAULT 0,
-                ban_reason TEXT NOT NULL DEFAULT ''
+                tracking_stage TEXT NOT NULL DEFAULT ''
             )
             """
         )
@@ -275,14 +205,6 @@ def init_db() -> None:
         if "search_access" not in columns:
             connection.execute(
                 "ALTER TABLE users ADD COLUMN search_access INTEGER NOT NULL DEFAULT 0"
-            )
-        if "banned" not in columns:
-            connection.execute(
-                "ALTER TABLE users ADD COLUMN banned INTEGER NOT NULL DEFAULT 0"
-            )
-        if "ban_reason" not in columns:
-            connection.execute(
-                "ALTER TABLE users ADD COLUMN ban_reason TEXT NOT NULL DEFAULT ''"
             )
 
 
@@ -332,8 +254,6 @@ def row_to_user(row: sqlite3.Row) -> dict:
         "order_number": int(row["order_number"] or 0),
         "tracking_code": row["tracking_code"] or "",
         "tracking_stage": row["tracking_stage"] or "",
-        "banned": bool(row["banned"] or 0),
-        "ban_reason": row["ban_reason"] or "",
     }
 
 
@@ -416,8 +336,7 @@ def save_users(users: dict[str, dict]) -> None:
                     id, first_name, last_name, username,
                     first_seen, last_seen, country, status,
                     note, search_access, order_number, tracking_code, tracking_stage
-                    , banned, ban_reason
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     first_name=excluded.first_name,
                     last_name=excluded.last_name,
@@ -430,9 +349,7 @@ def save_users(users: dict[str, dict]) -> None:
                     search_access=excluded.search_access,
                     order_number=excluded.order_number,
                     tracking_code=excluded.tracking_code,
-                    tracking_stage=excluded.tracking_stage,
-                    banned=excluded.banned,
-                    ban_reason=excluded.ban_reason
+                    tracking_stage=excluded.tracking_stage
                 """,
                 (
                     user_id,
@@ -448,8 +365,6 @@ def save_users(users: dict[str, dict]) -> None:
                     int(user.get("order_number", 0) or 0),
                     user.get("tracking_code", "") or "",
                     user.get("tracking_stage", "") or "",
-                    1 if user.get("banned") else 0,
-                    user.get("ban_reason", "") or "",
                 ),
             )
 
@@ -480,8 +395,6 @@ def update_user(
         "order_number": existing.get("order_number", 0),
         "tracking_code": existing.get("tracking_code", ""),
         "tracking_stage": existing.get("tracking_stage", ""),
-        "banned": bool(existing.get("banned", False)),
-        "ban_reason": existing.get("ban_reason", ""),
     }
 
     users[user_id] = user_data
@@ -531,209 +444,6 @@ def set_user_note(user_id: int, note: str) -> bool:
     return True
 
 
-def ban_user(user_id: int, reason: str) -> dict | None:
-    users = load_users()
-    key = str(user_id)
-    if key not in users:
-        return None
-
-    users[key]["banned"] = True
-    users[key]["ban_reason"] = reason.strip() or "Причина не указана"
-    users[key]["status"] = "Забанен"
-    users[key]["last_seen"] = now_str()
-    save_users(users)
-    return users[key]
-
-
-def unban_user(user_id: int) -> dict | None:
-    users = load_users()
-    key = str(user_id)
-    if key not in users:
-        return None
-
-    users[key]["banned"] = False
-    users[key]["ban_reason"] = ""
-    if users[key].get("status") == "Забанен":
-        users[key]["status"] = "Новый"
-    users[key]["last_seen"] = now_str()
-    save_users(users)
-    return users[key]
-
-
-def is_user_banned(user_id: int) -> bool:
-    user = get_user(user_id)
-    return bool(user and user.get("banned"))
-
-
-def get_banned_users() -> list[dict]:
-    users = [user for user in load_users().values() if user.get("banned")]
-    users.sort(key=lambda item: item.get("last_seen", ""), reverse=True)
-    return users
-
-
-def get_admin_dashboard_stats() -> dict[str, int]:
-    users = list(load_users().values())
-    orders = get_all_orders()
-    tracked = [user for user in orders if user.get("tracking_code")]
-    active_excel_files = len(get_cargo_workbook_files())
-    banned_users = sum(1 for user in users if user.get("banned"))
-    search_users_count = sum(1 for user in users if int(user.get("search_access", 0) or 0) > 0)
-    return {
-        "users_total": len(users),
-        "orders_total": len(orders),
-        "tracked_total": len(tracked),
-        "banned_total": banned_users,
-        "search_users_total": search_users_count,
-        "excel_total": active_excel_files,
-    }
-
-
-def get_cargo_tables_summary() -> str:
-    workbook_files = get_cargo_workbook_files()
-    if not workbook_files:
-        return "Таблиц карго пока нет."
-
-    latest_file = workbook_files[0]
-    latest_time = datetime.fromtimestamp(latest_file.stat().st_mtime).strftime("%d.%m.%Y %H:%M")
-    return (
-        f"Всего таблиц карго: {len(workbook_files)}\n"
-        f"Последняя таблица: {latest_file.name}\n"
-        f"Последнее изменение: {latest_time}"
-    )
-
-
-def clear_admin_cargo_state_for_workbook(user_id: int, workbook_path: Path) -> None:
-    state = admin_cargo_order_states.get(user_id)
-    if not state or state.get("workbook_path") != str(workbook_path):
-        return
-
-    photo_path = state.get("photo_path")
-    if photo_path:
-        try:
-            Path(photo_path).unlink()
-        except OSError:
-            pass
-    admin_cargo_order_states.pop(user_id, None)
-
-
-def delete_cargo_workbook(user_id: int, workbook_path: Path) -> bool:
-    clear_admin_cargo_state_for_workbook(user_id, workbook_path)
-    active_workbook = get_active_cargo_workbook(user_id)
-    if active_workbook and active_workbook == workbook_path:
-        admin_cargo_active_workbooks.pop(user_id, None)
-
-    try:
-        workbook_path.unlink()
-        return True
-    except OSError:
-        return False
-
-
-def normalize_cargo_field_name(raw_field: str) -> str | None:
-    field = raw_field.strip().lower()
-    mapping = {
-        "name": "name",
-        "товар": "name",
-        "название": "name",
-        "size": "size",
-        "размер": "size",
-        "color": "color",
-        "цвет": "color",
-        "price": "price",
-        "цена": "price",
-        "link": "link",
-        "url": "link",
-        "ссылка": "link",
-        "qty": "quantity",
-        "quantity": "quantity",
-        "количество": "quantity",
-        "delivery": "delivery",
-        "доставка": "delivery",
-    }
-    return mapping.get(field)
-
-
-def update_cargo_details_cell(
-    sheet,
-    row_number: int,
-    *,
-    size: str | None = None,
-    color: str | None = None,
-) -> None:
-    current_size, current_color = parse_cargo_details(sheet[f"{CARGO_DETAILS_COLUMN}{row_number}"].value)
-    final_size = current_size if size is None else size.strip()
-    final_color = current_color if color is None else color.strip()
-    sheet[f"{CARGO_DETAILS_COLUMN}{row_number}"] = f"Размер: {final_size}\nЦвет: {final_color}"
-
-
-def edit_cargo_workbook_item(
-    workbook_path: Path,
-    *,
-    row_number: int,
-    field_name: str,
-    value: str,
-) -> str:
-    try:
-        from openpyxl import load_workbook
-    except ImportError as error:
-        raise RuntimeError(
-            "Не хватает библиотек для редактирования Excel. Установи зависимости из requirements.txt."
-        ) from error
-
-    workbook = load_workbook(workbook_path)
-    try:
-        sheet = workbook[CARGO_SHEET_NAME] if CARGO_SHEET_NAME in workbook.sheetnames else workbook.active
-        if row_number < CARGO_START_ROW:
-            raise ValueError(f"Строка должна быть не меньше {CARGO_START_ROW}.")
-        if not is_cargo_row_filled(sheet, row_number):
-            raise ValueError("В этой строке нет заполненного товара.")
-
-        normalized_field = normalize_cargo_field_name(field_name)
-        if not normalized_field:
-            raise ValueError("Неизвестное поле. Доступно: name, size, color, link, price, quantity, delivery.")
-
-        cleaned_value = value.strip()
-        if normalized_field == "name":
-            if not cleaned_value:
-                raise ValueError("Название товара не может быть пустым.")
-            sheet[f"{CARGO_NAME_COLUMN}{row_number}"] = cleaned_value
-        elif normalized_field == "size":
-            update_cargo_details_cell(sheet, row_number, size=cleaned_value)
-        elif normalized_field == "color":
-            update_cargo_details_cell(sheet, row_number, color=cleaned_value)
-        elif normalized_field == "link":
-            sheet[f"{CARGO_LINK_COLUMN}{row_number}"] = cleaned_value
-            sheet[f"{CARGO_LINK_COLUMN}{row_number}"].hyperlink = cleaned_value
-        elif normalized_field == "price":
-            parsed_price = parse_price_value(cleaned_value)
-            if parsed_price is None:
-                raise ValueError("Цену не удалось распознать.")
-            sheet[f"{CARGO_PRICE_COLUMN}{row_number}"] = parsed_price
-        elif normalized_field == "quantity":
-            quantity = parse_price_value(cleaned_value)
-            if quantity is None or int(quantity) != quantity or int(quantity) <= 0:
-                raise ValueError("Количество должно быть целым числом больше нуля.")
-            sheet[f"{CARGO_QUANTITY_COLUMN}{row_number}"] = int(quantity)
-        elif normalized_field == "delivery":
-            delivery = parse_price_value(cleaned_value)
-            if delivery is None:
-                raise ValueError("Доставку не удалось распознать.")
-            sheet[f"{CARGO_DELIVERY_COLUMN}{row_number}"] = delivery
-
-        sheet[f"{CARGO_TOTAL_COLUMN}{row_number}"] = f"=F{row_number}*G{row_number}"
-        workbook.save(workbook_path)
-        return normalized_field
-    finally:
-        workbook.close()
-
-
-def get_random_user() -> dict | None:
-    users = list(load_users().values())
-    if not users:
-        return None
-    return random.choice(users)
-
-
 def assign_order_number(user_id: int) -> int | None:
     users = load_users()
     key = str(user_id)
@@ -755,7 +465,7 @@ def assign_order_number(user_id: int) -> int | None:
 def can_approve_order(user: dict | None) -> bool:
     if not user:
         return False
-    return user.get("status") in {"Заявка отправлена", "Отправляет данные", "Оплачен"}
+    return user.get("status") in {"Заявка отправлена", "Отправляет данные"}
 
 
 def can_cancel_order(user: dict | None) -> bool:
@@ -770,9 +480,6 @@ def can_cancel_order(user: dict | None) -> bool:
             "Оформляет заказ",
             "Отправляет данные",
             "Заявка отправлена",
-            "Ожидает оплату",
-            "Оплата на проверке",
-            "Оплачен",
             "Заказ обработан",
         }
     )
@@ -782,7 +489,7 @@ def get_pending_orders() -> list[dict]:
     users = load_users()
     pending = [
         user for user in users.values()
-        if user.get("status") in {"Заявка отправлена", "Отправляет данные", "Ожидает оплату", "Оплата на проверке"}
+        if user.get("status") in {"Заявка отправлена", "Отправляет данные"}
     ]
     pending.sort(key=lambda item: item.get("last_seen", ""), reverse=True)
     return pending
@@ -947,8 +654,6 @@ def format_order_card(user: dict, *, include_action_hint: bool = False) -> str:
         lines.append(f"Для одобрения: /done {user['id']}")
     if include_action_hint and user.get("status") != "Заказ отменен":
         lines.append(f"Для отмены: /cancel {user['id']}")
-    if user.get("banned"):
-        lines.append(f"Бан: Да ({user.get('ban_reason', '') or 'Причина не указана'})")
 
     return "\n".join(lines)
 
@@ -1040,15 +745,6 @@ def is_admin(message: Message) -> bool:
 async def maintenance_guard(message: Message) -> bool:
     if is_admin(message):
         return False
-    user = get_user(message.from_user.id) if message.from_user else None
-    if user and user.get("banned"):
-        reason = user.get("ban_reason", "") or "Причина не указана"
-        await message.answer(
-            "Доступ к боту ограничен.\n"
-            f"Причина: {reason}\n"
-            "Если это ошибка, свяжись с администратором."
-        )
-        return True
     if not is_maintenance_mode():
         return False
 
@@ -1087,655 +783,6 @@ async def maybe_send_rate_limit_notice(message: Message) -> None:
 
 def current_main_keyboard(message: Message) -> ReplyKeyboardMarkup:
     return admin_main_keyboard if is_admin(message) else user_main_keyboard
-
-
-def clear_admin_cargo_mode(message: Message) -> None:
-    if not message.from_user:
-        return
-    support_users.discard(message.from_user.id)
-    payment_users.discard(message.from_user.id)
-    reset_admin_cargo_order_state(message.from_user.id)
-    reset_admin_message_order_state(message.from_user.id)
-
-
-def reset_admin_cargo_order_state(user_id: int) -> None:
-    state = admin_cargo_order_states.pop(user_id, None)
-    if not state:
-        return
-
-    photo_path = state.get("photo_path")
-    if photo_path:
-        try:
-            Path(photo_path).unlink()
-        except OSError:
-            pass
-
-    workbook_path = state.get("workbook_path")
-    active_workbook_path = admin_cargo_active_workbooks.get(user_id)
-    is_filled = bool(state.get("workbook_filled"))
-    should_keep_workbook = workbook_path and workbook_path == active_workbook_path
-    if not workbook_path or is_filled or should_keep_workbook:
-        return
-
-    try:
-        Path(workbook_path).unlink()
-    except OSError:
-        pass
-
-
-def reset_admin_message_order_state(user_id: int) -> None:
-    state = admin_message_order_states.pop(user_id, None)
-    if not state:
-        return
-
-    photo_path = state.get("photo_path")
-    if photo_path:
-        try:
-            Path(photo_path).unlink()
-        except OSError:
-            pass
-
-
-def get_cargo_excel_error() -> str | None:
-    if not CARGO_TEMPLATE_XLSX.exists():
-        return f"Файл шаблона не найден: {CARGO_TEMPLATE_XLSX}"
-
-    try:
-        import openpyxl  # noqa: F401
-        from openpyxl.drawing.image import Image as XLImage  # noqa: F401
-    except ImportError:
-        return (
-            "Для работы с таблицей нужны библиотеки openpyxl и pillow.\n"
-            "Установи зависимости командой: python -m pip install -r requirements.txt"
-        )
-
-    return None
-
-
-def create_cargo_workbook_copy() -> Path:
-    CARGO_ORDERS_DIR.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    random_suffix = secrets.token_hex(2).upper()
-    target_path = CARGO_ORDERS_DIR / f"каргос_{stamp}_{random_suffix}.xlsx"
-    copy2(CARGO_TEMPLATE_XLSX, target_path)
-    return target_path
-
-
-def get_active_cargo_workbook(user_id: int) -> Path | None:
-    workbook_path = admin_cargo_active_workbooks.get(user_id)
-    if not workbook_path:
-        return None
-
-    path = Path(workbook_path)
-    if path.exists():
-        return path
-
-    admin_cargo_active_workbooks.pop(user_id, None)
-    return None
-
-
-def create_new_active_cargo_workbook(user_id: int) -> Path:
-    workbook_path = create_cargo_workbook_copy()
-    admin_cargo_active_workbooks[user_id] = str(workbook_path)
-    return workbook_path
-
-
-def set_active_cargo_workbook(user_id: int, workbook_path: Path) -> None:
-    admin_cargo_active_workbooks[user_id] = str(workbook_path)
-
-
-def clear_active_cargo_workbook(user_id: int) -> Path | None:
-    workbook_path = admin_cargo_active_workbooks.pop(user_id, None)
-    return Path(workbook_path) if workbook_path else None
-
-
-def get_cargo_workbook_files() -> list[Path]:
-    if not CARGO_ORDERS_DIR.exists():
-        return []
-
-    return sorted(
-        (path for path in CARGO_ORDERS_DIR.glob("*.xlsx") if path.is_file()),
-        key=lambda path: path.stat().st_mtime,
-        reverse=True,
-    )
-
-
-def resolve_cargo_workbook_reference(user_id: int, raw_reference: str | None) -> Path | None:
-    reference = (raw_reference or "").strip()
-    if not reference or reference.lower() in {"current", "active", "текущая", "текущий"}:
-        return get_active_cargo_workbook(user_id)
-
-    workbook_files = get_cargo_workbook_files()
-    if reference.isdigit():
-        index = int(reference)
-        if 1 <= index <= len(workbook_files):
-            return workbook_files[index - 1]
-
-    candidate = CARGO_ORDERS_DIR / reference
-    if candidate.exists() and candidate.is_file():
-        return candidate
-
-    candidate_with_suffix = candidate.with_suffix(".xlsx")
-    if candidate_with_suffix.exists() and candidate_with_suffix.is_file():
-        return candidate_with_suffix
-
-    for workbook_path in workbook_files:
-        if workbook_path.name == reference:
-            return workbook_path
-
-    return None
-
-
-def parse_cargo_details(value: object) -> tuple[str, str]:
-    if value in (None, ""):
-        return "", ""
-
-    size = ""
-    color = ""
-    for line in str(value).splitlines():
-        normalized = line.strip()
-        lower = normalized.lower()
-        if lower.startswith("размер:"):
-            size = normalized.split(":", 1)[1].strip()
-        elif lower.startswith("цвет:"):
-            color = normalized.split(":", 1)[1].strip()
-
-    return size, color
-
-
-def is_cargo_row_filled(sheet, row_number: int) -> bool:
-    cells_to_check = [
-        sheet[f"{CARGO_NAME_COLUMN}{row_number}"].value,
-        sheet[f"{CARGO_LINK_COLUMN}{row_number}"].value,
-        sheet[f"{CARGO_DETAILS_COLUMN}{row_number}"].value,
-        sheet[f"{CARGO_PRICE_COLUMN}{row_number}"].value,
-        sheet[f"{CARGO_PHOTO_COLUMN}{row_number}"].value,
-    ]
-    return any(str(value).strip() for value in cells_to_check if value not in (None, ""))
-
-
-def format_cargo_workbook_preview(workbook_path: Path) -> str:
-    try:
-        from openpyxl import load_workbook
-    except ImportError as error:
-        raise RuntimeError(
-            "Не хватает библиотек для просмотра Excel. Установи зависимости из requirements.txt."
-        ) from error
-
-    workbook = load_workbook(workbook_path, data_only=False)
-    try:
-        sheet = workbook[CARGO_SHEET_NAME] if CARGO_SHEET_NAME in workbook.sheetnames else workbook.active
-        lines = [
-            f"Таблица: {workbook_path.name}",
-            f"Лист: {sheet.title}",
-            "",
-        ]
-
-        item_lines: list[str] = []
-        for row_number in range(CARGO_START_ROW, sheet.max_row + 1):
-            if not is_cargo_row_filled(sheet, row_number):
-                continue
-
-            item_name = sheet[f"{CARGO_NAME_COLUMN}{row_number}"].value
-            link = sheet[f"{CARGO_LINK_COLUMN}{row_number}"].value
-            details = sheet[f"{CARGO_DETAILS_COLUMN}{row_number}"].value
-            price = sheet[f"{CARGO_PRICE_COLUMN}{row_number}"].value
-            quantity = sheet[f"{CARGO_QUANTITY_COLUMN}{row_number}"].value
-            total = sheet[f"{CARGO_TOTAL_COLUMN}{row_number}"].value
-            delivery = sheet[f"{CARGO_DELIVERY_COLUMN}{row_number}"].value
-
-            size, color = parse_cargo_details(details)
-            item_lines.append(
-                "\n".join(
-                    [
-                        f"Строка {row_number}",
-                        f"Товар: {item_name or 'Не указан'}",
-                        f"Размер: {size or 'Не указан'}",
-                        f"Цвет: {color or 'Не указан'}",
-                        f"Ссылка: {link or 'Не указана'}",
-                        f"Цена: {price if price not in (None, '') else 'Не указана'}",
-                        f"Количество: {quantity if quantity not in (None, '') else 'Не указано'}",
-                        f"Сумма: {total if total not in (None, '') else 'Не указана'}",
-                        f"Доставка: {delivery if delivery not in (None, '') else 'Не указана'}",
-                    ]
-                )
-            )
-
-        if not item_lines:
-            lines.append("В таблице пока нет заполненных товаров.")
-        else:
-            lines.append(f"Товаров в таблице: {len(item_lines)}")
-            lines.append("")
-            lines.extend(item_lines)
-
-        return "\n\n".join(lines)
-    finally:
-        workbook.close()
-
-
-def is_expected_total_formula(value: object, row_number: int) -> bool:
-    if value in (None, ""):
-        return True
-
-    formula = str(value).replace("$", "").replace(" ", "").upper()
-    return formula in {
-        f"=F{row_number}*G{row_number}",
-        f"F{row_number}*G{row_number}",
-    }
-
-
-def is_cargo_row_available(sheet, row_number: int) -> bool:
-    cells_to_check = [
-        sheet[f"{CARGO_NAME_COLUMN}{row_number}"].value,
-        sheet[f"{CARGO_LINK_COLUMN}{row_number}"].value,
-        sheet[f"{CARGO_DETAILS_COLUMN}{row_number}"].value,
-        sheet[f"{CARGO_PRICE_COLUMN}{row_number}"].value,
-        sheet[f"{CARGO_PHOTO_COLUMN}{row_number}"].value,
-    ]
-    if any(str(value).strip() for value in cells_to_check if value not in (None, "")):
-        return False
-
-    return is_expected_total_formula(
-        sheet[f"{CARGO_TOTAL_COLUMN}{row_number}"].value,
-        row_number,
-    )
-
-
-def find_next_cargo_row(sheet) -> int | None:
-    for row_number in range(CARGO_START_ROW, sheet.max_row + 1):
-        if is_cargo_row_available(sheet, row_number):
-            return row_number
-    return None
-
-
-def parse_price_value(text: str) -> int | float | None:
-    normalized = text.replace(" ", "").replace(",", ".")
-    match = re.search(r"\d+(?:\.\d+)?", normalized)
-    if not match:
-        return None
-
-    value = float(match.group(0))
-    if value.is_integer():
-        return int(value)
-    return round(value, 2)
-
-
-def copy_cargo_row_style(sheet, source_row: int, target_row: int) -> None:
-    for column in range(1, sheet.max_column + 1):
-        source_cell = sheet.cell(row=source_row, column=column)
-        target_cell = sheet.cell(row=target_row, column=column)
-        target_cell._style = copy(source_cell._style)
-        if source_cell.number_format:
-            target_cell.number_format = source_cell.number_format
-        if source_cell.font:
-            target_cell.font = copy(source_cell.font)
-        if source_cell.fill:
-            target_cell.fill = copy(source_cell.fill)
-        if source_cell.border:
-            target_cell.border = copy(source_cell.border)
-        if source_cell.alignment:
-            target_cell.alignment = copy(source_cell.alignment)
-        if source_cell.protection:
-            target_cell.protection = copy(source_cell.protection)
-
-    if source_row in sheet.row_dimensions:
-        sheet.row_dimensions[target_row].height = sheet.row_dimensions[source_row].height
-
-
-def prepare_new_cargo_row(sheet) -> int:
-    row_number = find_next_cargo_row(sheet)
-    if row_number is not None:
-        return row_number
-
-    insert_at = 19
-    sheet.insert_rows(insert_at)
-    copy_cargo_row_style(sheet, 18, insert_at)
-    sheet[f"{CARGO_QUANTITY_COLUMN}{insert_at}"] = 1
-    sheet[f"{CARGO_TOTAL_COLUMN}{insert_at}"] = f"=F{insert_at}*G{insert_at}"
-    sheet[f"{CARGO_DELIVERY_COLUMN}{insert_at}"] = 0
-    return insert_at
-
-
-def write_cargo_order_to_excel(
-    *,
-    workbook_path: Path,
-    photo_path: Path,
-    size: str,
-    item_name: str,
-    color: str,
-    link: str,
-    price: int | float,
-) -> int:
-    try:
-        from openpyxl import load_workbook
-        from openpyxl.drawing.image import Image as XLImage
-    except ImportError as error:
-        raise RuntimeError(
-            "Не хватает библиотек для работы с Excel. Установи зависимости из requirements.txt."
-        ) from error
-
-    workbook = load_workbook(workbook_path)
-    try:
-        sheet = workbook[CARGO_SHEET_NAME] if CARGO_SHEET_NAME in workbook.sheetnames else workbook.active
-        row_number = prepare_new_cargo_row(sheet)
-
-        sheet[f"{CARGO_NAME_COLUMN}{row_number}"] = item_name.strip()
-        sheet[f"{CARGO_LINK_COLUMN}{row_number}"] = link.strip()
-        sheet[f"{CARGO_LINK_COLUMN}{row_number}"].hyperlink = link.strip()
-        sheet[f"{CARGO_DETAILS_COLUMN}{row_number}"] = (
-            f"Размер: {size.strip()}\n"
-            f"Цвет: {color.strip()}"
-        )
-        sheet[f"{CARGO_PRICE_COLUMN}{row_number}"] = price
-        sheet[f"{CARGO_QUANTITY_COLUMN}{row_number}"] = sheet[f"{CARGO_QUANTITY_COLUMN}{row_number}"].value or 1
-        sheet[f"{CARGO_TOTAL_COLUMN}{row_number}"] = f"=F{row_number}*G{row_number}"
-        sheet[f"{CARGO_DELIVERY_COLUMN}{row_number}"] = sheet[f"{CARGO_DELIVERY_COLUMN}{row_number}"].value or 0
-        sheet.row_dimensions[row_number].height = 78
-
-        image = XLImage(str(photo_path))
-        image.width = CARGO_IMAGE_WIDTH
-        image.height = CARGO_IMAGE_HEIGHT
-        sheet.add_image(image, f"{CARGO_PHOTO_COLUMN}{row_number}")
-
-        workbook.save(workbook_path)
-        return row_number
-    finally:
-        workbook.close()
-
-
-async def download_cargo_photo(bot: Bot, message: Message) -> Path | None:
-    if not message.from_user:
-        return None
-
-    telegram_file = None
-    suffix = ".jpg"
-
-    if message.photo:
-        telegram_file = await bot.get_file(message.photo[-1].file_id)
-    elif message.document and (message.document.mime_type or "").startswith("image/"):
-        telegram_file = await bot.get_file(message.document.file_id)
-        suffix = Path(message.document.file_name or "").suffix or ".jpg"
-
-    if telegram_file is None:
-        return None
-
-    CARGO_PHOTO_DIR.mkdir(parents=True, exist_ok=True)
-    destination = CARGO_PHOTO_DIR / f"cargo_{message.from_user.id}_{int(time.time() * 1000)}{suffix}"
-    with destination.open("wb") as output:
-        await bot.download(telegram_file, destination=output)
-    return destination
-
-
-async def start_admin_message_order_flow(message: Message) -> None:
-    if not message.from_user:
-        return
-
-    user_id = message.from_user.id
-    reset_admin_cargo_order_state(user_id)
-    reset_admin_message_order_state(user_id)
-    china_order_users.discard(user_id)
-    admin_search_users.discard(user_id)
-    paid_search_users.discard(user_id)
-    tracking_lookup_users.discard(user_id)
-    admin_message_order_states[user_id] = {
-        "step": "photo",
-    }
-    update_user(message, status="Админ оформляет заказ сообщением")
-    await message.answer(
-        "Оформление заказа сообщением начато.\n"
-        "Скиньте фотографию.",
-        reply_markup=admin_cargo_order_keyboard,
-    )
-
-
-async def handle_admin_message_order_step(message: Message, bot: Bot) -> bool:
-    if not message.from_user or not is_admin(message):
-        return False
-
-    state = admin_message_order_states.get(message.from_user.id)
-    if not state:
-        return False
-
-    step = state.get("step", "photo")
-
-    if step == "photo":
-        photo_path = await download_cargo_photo(bot, message)
-        if not photo_path:
-            await message.answer(
-                "Нужна именно фотография товара.\n"
-                "Пришли фото как изображение или файлом-картинкой.",
-                reply_markup=admin_cargo_order_keyboard,
-            )
-            return True
-
-        state["photo_path"] = str(photo_path)
-        state["step"] = "size"
-        await message.answer("Размер", reply_markup=admin_cargo_order_keyboard)
-        return True
-
-    text = (message.text or "").strip()
-    if not text:
-        prompts = {
-            "size": "Отправь размер текстом.",
-            "name": "Отправь наименование товара текстом.",
-            "color": "Отправь цвет товара текстом.",
-            "link": "Отправь ссылку на товар текстом.",
-        }
-        await message.answer(prompts.get(step, "Отправь данные текстом."), reply_markup=admin_cargo_order_keyboard)
-        return True
-
-    if step == "size":
-        state["size"] = text
-        state["step"] = "name"
-        await message.answer("Наименование товара", reply_markup=admin_cargo_order_keyboard)
-        return True
-
-    if step == "name":
-        state["name"] = text
-        state["step"] = "color"
-        await message.answer("Цвет товара", reply_markup=admin_cargo_order_keyboard)
-        return True
-
-    if step == "color":
-        state["color"] = text
-        state["step"] = "link"
-        await message.answer("Ссылка на товар", reply_markup=admin_cargo_order_keyboard)
-        return True
-
-    if step != "link":
-        return False
-
-    state["link"] = text
-    photo_path = Path(state["photo_path"])
-    caption = (
-        "Оформленный заказ:\n\n"
-        f"Товар: {state.get('name', '')}\n"
-        f"Размер: {state.get('size', '')}\n"
-        f"Цвет: {state.get('color', '')}\n"
-        f"Ссылка: {state.get('link', '')}"
-    )
-
-    try:
-        await bot.send_photo(
-            ADMIN_ID,
-            photo=FSInputFile(str(photo_path)),
-            caption=caption,
-        )
-    except Exception as error:
-        await message.answer(
-            "Не удалось отправить собранный заказ одним сообщением.\n"
-            f"Ошибка: {error}",
-            reply_markup=current_main_keyboard(message),
-        )
-        reset_admin_message_order_state(message.from_user.id)
-        return True
-
-    reset_admin_message_order_state(message.from_user.id)
-    update_user(message, status="Админ оформил заказ сообщением")
-    await message.answer(
-        "Готово. Заказ отправлен одним сообщением.\n"
-        f"Товар: {state.get('name', '')}\n"
-        f"Размер: {state.get('size', '')}\n"
-        f"Цвет: {state.get('color', '')}\n"
-        f"Ссылка: {state.get('link', '')}",
-        reply_markup=current_main_keyboard(message),
-    )
-    return True
-
-
-async def start_admin_cargo_order_flow(message: Message, *, force_new_workbook: bool = False) -> None:
-    if not message.from_user:
-        return
-
-    excel_error = get_cargo_excel_error()
-    if excel_error:
-        await message.answer(excel_error)
-        return
-
-    user_id = message.from_user.id
-    reset_admin_cargo_order_state(user_id)
-    workbook_path = (
-        create_new_active_cargo_workbook(user_id)
-        if force_new_workbook
-        else get_active_cargo_workbook(user_id) or create_new_active_cargo_workbook(user_id)
-    )
-    china_order_users.discard(user_id)
-    admin_search_users.discard(user_id)
-    paid_search_users.discard(user_id)
-    tracking_lookup_users.discard(user_id)
-    admin_cargo_order_states[user_id] = {
-        "step": "photo",
-        "workbook_path": str(workbook_path),
-    }
-    update_user(message, status="Админ оформляет заказ в Excel")
-    if force_new_workbook:
-        text = (
-            "Оформление заказа в новой таблице начато.\n"
-            f"Файл: {workbook_path.name}\n"
-            "Скиньте фотографию."
-        )
-    else:
-        text = (
-            "Оформление заказа открыто.\n"
-            f"Текущий файл: {workbook_path.name}\n"
-            "Новый товар будет добавлен в эту же таблицу.\n"
-            "Скиньте фотографию."
-        )
-
-    await message.answer(text, reply_markup=admin_cargo_order_keyboard)
-
-
-async def handle_admin_cargo_order_step(message: Message, bot: Bot) -> bool:
-    if not message.from_user or not is_admin(message):
-        return False
-
-    state = admin_cargo_order_states.get(message.from_user.id)
-    if not state:
-        return False
-
-    step = state.get("step", "photo")
-
-    if step == "photo":
-        photo_path = await download_cargo_photo(bot, message)
-        if not photo_path:
-            await message.answer(
-                "Нужна именно фотография товара.\n"
-                "Пришли фото как изображение или файлом-картинкой.",
-                reply_markup=admin_cargo_order_keyboard,
-            )
-            return True
-
-        state["photo_path"] = str(photo_path)
-        state["step"] = "size"
-        await message.answer("Размер", reply_markup=admin_cargo_order_keyboard)
-        return True
-
-    text = (message.text or "").strip()
-    if not text:
-        prompts = {
-            "size": "Отправь размер текстом.",
-            "name": "Отправь наименование товара текстом.",
-            "color": "Отправь цвет товара текстом.",
-            "link": "Отправь ссылку на товар текстом.",
-            "price": "Отправь ценник числом, например 199 или 199.5.",
-        }
-        await message.answer(prompts.get(step, "Отправь данные текстом."), reply_markup=admin_cargo_order_keyboard)
-        return True
-
-    if step == "size":
-        state["size"] = text
-        state["step"] = "name"
-        await message.answer("Наименование товара", reply_markup=admin_cargo_order_keyboard)
-        return True
-
-    if step == "name":
-        state["name"] = text
-        state["step"] = "color"
-        await message.answer("Цвет товара", reply_markup=admin_cargo_order_keyboard)
-        return True
-
-    if step == "color":
-        state["color"] = text
-        state["step"] = "link"
-        await message.answer("Ссылка на товар", reply_markup=admin_cargo_order_keyboard)
-        return True
-
-    if step == "link":
-        state["link"] = text
-        state["step"] = "price"
-        await message.answer("Ценник", reply_markup=admin_cargo_order_keyboard)
-        return True
-
-    if step != "price":
-        return False
-
-    price_value = parse_price_value(text)
-    if price_value is None:
-        await message.answer(
-            "Не смог распознать ценник.\n"
-            "Отправь его числом, например 299 или 299.5.",
-            reply_markup=admin_cargo_order_keyboard,
-        )
-        return True
-
-    photo_path = Path(state["photo_path"])
-    workbook_path = Path(state["workbook_path"])
-    try:
-        row_number = write_cargo_order_to_excel(
-            workbook_path=workbook_path,
-            photo_path=photo_path,
-            size=str(state.get("size", "")),
-            item_name=str(state.get("name", "")),
-            color=str(state.get("color", "")),
-            link=str(state.get("link", "")),
-            price=price_value,
-        )
-    except Exception as error:
-        await message.answer(
-            "Не удалось записать позицию в Excel.\n"
-            f"Ошибка: {error}",
-            reply_markup=current_main_keyboard(message),
-        )
-        reset_admin_cargo_order_state(message.from_user.id)
-        return True
-
-    state["workbook_filled"] = True
-    reset_admin_cargo_order_state(message.from_user.id)
-    update_user(message, status="Админ оформил заказ в Excel")
-    await message.answer(
-        "Готово. Позиция добавлена в таблицу.\n"
-        f"Файл: {workbook_path.name}\n"
-        f"Строка: {row_number}\n"
-        f"Товар: {state.get('name', '')}\n"
-        f"Размер: {state.get('size', '')}\n"
-        f"Цвет: {state.get('color', '')}\n"
-        f"Ссылка: {state.get('link', '')}\n"
-        f"Цена: {price_value}\n\n"
-        "Чтобы добавить ещё товар в эту же таблицу, снова нажми 'Оформить заказ' или используй /excelorder.\n"
-        "Чтобы начать новую таблицу, используй /newexcelorder.",
-        reply_markup=current_main_keyboard(message),
-    )
-    return True
 
 
 def normalize_query(text: str) -> str:
@@ -1834,44 +881,6 @@ async def send_photo_or_text(
     await message.answer(caption, reply_markup=reply_markup)
 
 
-async def setup_bot_commands(bot: Bot) -> None:
-    default_commands = [
-        BotCommand(command="start", description="Запустить бота"),
-        BotCommand(command="help", description="Помощь"),
-        BotCommand(command="track", description="Проверить статус заказа"),
-    ]
-    await bot.set_my_commands(default_commands, scope=BotCommandScopeDefault())
-
-    admin_commands = [
-        BotCommand(command="admin", description="Админ-панель"),
-        BotCommand(command="users", description="Список пользователей"),
-        BotCommand(command="orders", description="Все заказы"),
-        BotCommand(command="active", description="Активные заказы"),
-        BotCommand(command="today", description="Сводка за сегодня"),
-        BotCommand(command="dashboard", description="Быстрый дашборд"),
-        BotCommand(command="excelorder", description="Добавить товар в текущую таблицу"),
-        BotCommand(command="newexcelorder", description="Начать новую таблицу"),
-        BotCommand(command="messageorder", description="Собрать заказ в одно сообщение"),
-        BotCommand(command="excelfiles", description="Показать таблицы карго"),
-        BotCommand(command="activeexcel", description="Текущая активная таблица"),
-        BotCommand(command="setactiveexcel", description="Сделать таблицу текущей"),
-        BotCommand(command="closeexcel", description="Закрыть активную таблицу"),
-        BotCommand(command="excelsend", description="Отправить таблицу файлом"),
-        BotCommand(command="excelview", description="Посмотреть содержимое таблицы"),
-        BotCommand(command="exceldelete", description="Удалить таблицу"),
-        BotCommand(command="exceledit", description="Изменить строку в таблице"),
-        BotCommand(command="cargostats", description="Сводка по таблицам"),
-        BotCommand(command="ban", description="Забанить пользователя"),
-        BotCommand(command="unban", description="Разбанить пользователя"),
-        BotCommand(command="banned", description="Список забаненных"),
-        BotCommand(command="payreq", description="Отправить реквизиты на оплату"),
-        BotCommand(command="paid", description="Подтвердить оплату"),
-        BotCommand(command="randomuser", description="Случайный пользователь"),
-        BotCommand(command="adminfun", description="Случайная админ-фраза"),
-    ]
-    await bot.set_my_commands(admin_commands, scope=BotCommandScopeChat(chat_id=ADMIN_ID))
-
-
 async def send_main_menu(message: Message, user_name: str) -> None:
     await send_photo_or_text(
         message,
@@ -1897,22 +906,6 @@ async def notify_admin(bot: Bot, message: Message) -> None:
         "Чтобы ответить, используй:\n"
         "/send user_id текст\n"
         "/done user_id",
-    )
-
-
-async def notify_admin_support(bot: Bot, message: Message) -> None:
-    if not message.from_user or message.from_user.id == ADMIN_ID:
-        return
-
-    username = f"@{message.from_user.username}" if message.from_user.username else "без username"
-    await bot.send_message(
-        ADMIN_ID,
-        "Новый вопрос в техподдержку:\n\n"
-        f"ID: {message.from_user.id}\n"
-        f"Имя: {message.from_user.full_name}\n"
-        f"Username: {username}\n\n"
-        "Чтобы ответить, используй:\n"
-        f"/send {message.from_user.id} текст"
     )
 
 
@@ -2002,7 +995,6 @@ async def cmd_start(message: Message) -> None:
     if is_rate_limited(message):
         await maybe_send_rate_limit_notice(message)
         return
-    clear_admin_cargo_mode(message)
     update_user(message, status="Запустил бота")
     user_name = message.from_user.first_name if message.from_user else "друг"
     await send_main_menu(message, user_name)
@@ -2015,7 +1007,6 @@ async def cmd_help(message: Message) -> None:
     if is_rate_limited(message):
         await maybe_send_rate_limit_notice(message)
         return
-    clear_admin_cargo_mode(message)
     update_user(message)
     await message.answer(
         "Команды:\n"
@@ -2033,7 +1024,6 @@ async def cmd_help(message: Message) -> None:
 
 @dp.message(Command("admin"))
 async def admin_panel(message: Message) -> None:
-    clear_admin_cargo_mode(message)
     update_user(message)
     if not is_admin(message):
         await message.answer("У тебя нет доступа к админ-панели.")
@@ -2043,7 +1033,6 @@ async def admin_panel(message: Message) -> None:
     await message.answer(
         "Админ-панель:\n\n"
         f"Техобслуживание: {maintenance_status}\n\n"
-        "Кнопка 'Оформить заказ' - добавить товар в Excel пошагово\n"
         "/users - список пользователей\n"
         "/orders - все заказы и их статусы\n"
         "/active - только активные заказы\n"
@@ -2060,31 +1049,11 @@ async def admin_panel(message: Message) -> None:
         "/owner код - узнать владельца трек-кода\n"
         "/status user_id текст - вручную сменить статус\n"
         "/stats - статистика по боту\n"
-        "/dashboard - быстрый дашборд по боту\n"
         "/note user_id текст - заметка по пользователю\n"
         "/clearnote user_id - очистить заметку\n"
-        "/ban user_id причина - забанить пользователя\n"
-        "/unban user_id - разбанить пользователя\n"
-        "/banned - список забаненных пользователей\n"
-        "/payreq user_id реквизиты - отправить реквизиты на оплату\n"
-        "/paid user_id - отметить оплату как подтвержденную\n"
         "/send user_id текст - отправить сообщение пользователю\n"
         "/broadcast текст - отправить сообщение всем пользователям\n"
         "/maintenance on|off - включить или выключить техобслуживание\n"
-        "/excelorder - добавить товар в текущую таблицу карго\n"
-        "/newexcelorder - начать новую таблицу карго\n"
-        "/messageorder - оформить заказ и отправить его одним сообщением\n"
-        "/excelfiles - показать все таблицы карго\n"
-        "/activeexcel - показать текущую активную таблицу\n"
-        "/setactiveexcel [номер|имя] - сделать таблицу текущей\n"
-        "/closeexcel - закрыть текущую активную таблицу\n"
-        "/excelsend [номер|имя|current] - отправить таблицу файлом\n"
-        "/excelview [номер|имя|current] - показать содержимое таблицы\n"
-        "/exceldelete [номер|имя|current] - удалить таблицу карго\n"
-        "/exceledit [номер|имя|current] строка поле значение - изменить товар в таблице\n"
-        "/cargostats - короткая сводка по таблицам карго\n"
-        "/randomuser - случайный пользователь\n"
-        "/adminfun - случайная админ-фраза\n"
         "/done user_id - обработать заказ и выдать трек-код\n"
         "/cancel user_id - отменить заказ клиента\n"
         "/track код - посмотреть этап заказа\n"
@@ -2103,506 +1072,6 @@ async def admin_panel(message: Message) -> None:
         "3 - Отправлен\n"
         "4 - Приехал в РФ"
     )
-
-
-@dp.message(Command("excelorder"))
-async def admin_excel_order_command(message: Message) -> None:
-    if not is_admin(message):
-        await message.answer("У тебя нет доступа к этой команде.")
-        return
-
-    await start_admin_cargo_order_flow(message)
-
-
-@dp.message(Command("newexcelorder"))
-async def admin_new_excel_order_command(message: Message) -> None:
-    if not is_admin(message):
-        await message.answer("У тебя нет доступа к этой команде.")
-        return
-
-    await start_admin_cargo_order_flow(message, force_new_workbook=True)
-
-
-@dp.message(Command("messageorder"))
-async def admin_message_order_command(message: Message) -> None:
-    if not is_admin(message):
-        await message.answer("У тебя нет доступа к этой команде.")
-        return
-
-    await start_admin_message_order_flow(message)
-
-
-@dp.message(Command("excelfiles"))
-async def admin_excel_files_command(message: Message) -> None:
-    if not is_admin(message):
-        await message.answer("У тебя нет доступа к этой команде.")
-        return
-
-    workbook_files = get_cargo_workbook_files()
-    if not workbook_files:
-        await message.answer("Таблиц карго пока нет.")
-        return
-
-    active_workbook = get_active_cargo_workbook(message.from_user.id) if message.from_user else None
-    lines = ["Таблицы карго:", ""]
-    for index, workbook_path in enumerate(workbook_files, start=1):
-        modified_at = datetime.fromtimestamp(workbook_path.stat().st_mtime).strftime("%d.%m.%Y %H:%M")
-        marker = " [текущая]" if active_workbook and workbook_path == active_workbook else ""
-        lines.append(f"{index}. {workbook_path.name}{marker}")
-        lines.append(f"Изменена: {modified_at}")
-
-    lines.append("")
-    lines.append("Чтобы посмотреть содержимое, используй /excelview номер")
-    lines.append("Или /excelview current для текущей таблицы.")
-    await send_long_text(message, "\n".join(lines))
-
-
-@dp.message(Command("activeexcel"))
-async def admin_active_excel_command(message: Message) -> None:
-    if not is_admin(message):
-        await message.answer("У тебя нет доступа к этой команде.")
-        return
-
-    if not message.from_user:
-        return
-
-    workbook_path = get_active_cargo_workbook(message.from_user.id)
-    if not workbook_path:
-        await message.answer(
-            "Текущая активная таблица не выбрана.\n"
-            "Используй /setactiveexcel номер или /excelorder для создания/открытия таблицы."
-        )
-        return
-
-    modified_at = datetime.fromtimestamp(workbook_path.stat().st_mtime).strftime("%d.%m.%Y %H:%M")
-    await message.answer(
-        "Текущая активная таблица:\n\n"
-        f"Файл: {workbook_path.name}\n"
-        f"Изменена: {modified_at}"
-    )
-
-
-@dp.message(Command("setactiveexcel"))
-async def admin_set_active_excel_command(message: Message) -> None:
-    if not is_admin(message):
-        await message.answer("У тебя нет доступа к этой команде.")
-        return
-
-    parts = (message.text or "").split(maxsplit=1)
-    if len(parts) < 2 or not parts[1].strip():
-        await message.answer("Используй формат: /setactiveexcel номер|имя")
-        return
-
-    if not message.from_user:
-        return
-
-    workbook_path = resolve_cargo_workbook_reference(message.from_user.id, parts[1].strip())
-    if not workbook_path:
-        await message.answer("Таблица не найдена. Используй /excelfiles, чтобы посмотреть список.")
-        return
-
-    set_active_cargo_workbook(message.from_user.id, workbook_path)
-    await message.answer(
-        "Текущая таблица переключена.\n"
-        f"Файл: {workbook_path.name}\n"
-        "Теперь /excelorder будет дописывать товары именно в неё."
-    )
-
-
-@dp.message(Command("closeexcel"))
-async def admin_close_excel_command(message: Message) -> None:
-    if not is_admin(message):
-        await message.answer("У тебя нет доступа к этой команде.")
-        return
-
-    if not message.from_user:
-        return
-
-    workbook_path = clear_active_cargo_workbook(message.from_user.id)
-    if not workbook_path:
-        await message.answer("Сейчас нет активной таблицы, которую нужно закрыть.")
-        return
-
-    await message.answer(
-        "Активная таблица закрыта.\n"
-        f"Файл: {workbook_path.name}\n"
-        "Следующий /excelorder создаст новую таблицу или попросит выбрать другую через /setactiveexcel."
-    )
-
-
-@dp.message(Command("excelsend"))
-async def admin_excel_send_command(message: Message, bot: Bot) -> None:
-    if not is_admin(message):
-        await message.answer("У тебя нет доступа к этой команде.")
-        return
-
-    raw_reference = ""
-    if message.text:
-        parts = message.text.split(maxsplit=1)
-        if len(parts) > 1:
-            raw_reference = parts[1]
-
-    if not message.from_user:
-        return
-
-    workbook_path = resolve_cargo_workbook_reference(message.from_user.id, raw_reference)
-    if not workbook_path:
-        await message.answer(
-            "Таблица не найдена.\n"
-            "Используй /excelfiles, чтобы посмотреть список, или /excelsend current для текущей."
-        )
-        return
-
-    try:
-        await bot.send_document(
-            message.chat.id,
-            document=FSInputFile(str(workbook_path)),
-            caption=f"Таблица: {workbook_path.name}",
-        )
-    except Exception as error:
-        await message.answer(
-            "Не удалось отправить таблицу.\n"
-            f"Ошибка: {error}"
-        )
-        return
-
-
-@dp.message(Command("excelview"))
-async def admin_excel_view_command(message: Message) -> None:
-    if not is_admin(message):
-        await message.answer("У тебя нет доступа к этой команде.")
-        return
-
-    raw_reference = ""
-    if message.text:
-        parts = message.text.split(maxsplit=1)
-        if len(parts) > 1:
-            raw_reference = parts[1]
-
-    user_id = message.from_user.id if message.from_user else 0
-    workbook_path = resolve_cargo_workbook_reference(user_id, raw_reference)
-    if not workbook_path:
-        await message.answer(
-            "Не нашёл таблицу.\n"
-            "Используй /excelfiles, чтобы посмотреть список.\n"
-            "Для текущей таблицы можно написать /excelview current."
-        )
-        return
-
-    try:
-        preview_text = format_cargo_workbook_preview(workbook_path)
-    except Exception as error:
-        await message.answer(
-            "Не удалось прочитать таблицу.\n"
-            f"Ошибка: {error}"
-        )
-        return
-
-    await send_long_text(message, preview_text)
-
-
-@dp.message(Command("exceldelete"))
-async def admin_excel_delete_command(message: Message) -> None:
-    if not is_admin(message):
-        await message.answer("У тебя нет доступа к этой команде.")
-        return
-
-    parts = (message.text or "").split(maxsplit=1)
-    if len(parts) < 2 or not parts[1].strip():
-        await message.answer("Используй формат: /exceldelete номер|имя|current")
-        return
-
-    user_id = message.from_user.id if message.from_user else 0
-    workbook_path = resolve_cargo_workbook_reference(user_id, parts[1].strip())
-    if not workbook_path:
-        await message.answer("Таблица не найдена. Используй /excelfiles, чтобы посмотреть список.")
-        return
-
-    if not delete_cargo_workbook(user_id, workbook_path):
-        await message.answer("Не удалось удалить таблицу.")
-        return
-
-    await message.answer(f"Таблица удалена: {workbook_path.name}")
-
-
-@dp.message(Command("exceledit"))
-async def admin_excel_edit_command(message: Message) -> None:
-    if not is_admin(message):
-        await message.answer("У тебя нет доступа к этой команде.")
-        return
-
-    parts = (message.text or "").split(maxsplit=4)
-    if len(parts) < 5:
-        await message.answer(
-            "Используй формат: /exceledit номер|имя|current строка поле значение\n"
-            "Поля: name, size, color, link, price, quantity, delivery"
-        )
-        return
-
-    reference = parts[1].strip()
-    row_raw = parts[2].strip()
-    field_name = parts[3].strip()
-    value = parts[4].strip()
-
-    try:
-        row_number = int(row_raw)
-    except ValueError:
-        await message.answer("Номер строки должен быть числом.")
-        return
-
-    user_id = message.from_user.id if message.from_user else 0
-    workbook_path = resolve_cargo_workbook_reference(user_id, reference)
-    if not workbook_path:
-        await message.answer("Таблица не найдена. Используй /excelfiles, чтобы посмотреть список.")
-        return
-
-    try:
-        normalized_field = edit_cargo_workbook_item(
-            workbook_path,
-            row_number=row_number,
-            field_name=field_name,
-            value=value,
-        )
-    except Exception as error:
-        await message.answer(
-            "Не удалось изменить таблицу.\n"
-            f"Ошибка: {error}"
-        )
-        return
-
-    await message.answer(
-        "Таблица обновлена.\n"
-        f"Файл: {workbook_path.name}\n"
-        f"Строка: {row_number}\n"
-        f"Поле: {normalized_field}\n"
-        f"Новое значение: {value}"
-    )
-
-
-@dp.message(Command("cargostats"))
-async def admin_cargo_stats_command(message: Message) -> None:
-    if not is_admin(message):
-        await message.answer("У тебя нет доступа к этой команде.")
-        return
-
-    await message.answer(get_cargo_tables_summary())
-
-
-@dp.message(Command("dashboard"))
-async def admin_dashboard_command(message: Message) -> None:
-    if not is_admin(message):
-        await message.answer("У тебя нет доступа к этой команде.")
-        return
-
-    stats = get_admin_dashboard_stats()
-    await message.answer(
-        "Быстрый дашборд:\n\n"
-        f"Всего пользователей: {stats['users_total']}\n"
-        f"Всего заказов: {stats['orders_total']}\n"
-        f"С трек-кодами: {stats['tracked_total']}\n"
-        f"Пользователей с поиском: {stats['search_users_total']}\n"
-        f"Забанено пользователей: {stats['banned_total']}\n"
-        f"Таблиц карго: {stats['excel_total']}\n"
-        f"Техобслуживание: {'включено' if is_maintenance_mode() else 'выключено'}"
-    )
-
-
-@dp.message(Command("randomuser"))
-async def admin_random_user_command(message: Message) -> None:
-    if not is_admin(message):
-        await message.answer("У тебя нет доступа к этой команде.")
-        return
-
-    user = get_random_user()
-    if not user:
-        await message.answer("Пользователей пока нет.")
-        return
-
-    await message.answer("Случайный пользователь:\n\n" + format_order_card(user, include_action_hint=True))
-
-
-@dp.message(Command("adminfun"))
-async def admin_fun_command(message: Message) -> None:
-    if not is_admin(message):
-        await message.answer("У тебя нет доступа к этой команде.")
-        return
-
-    quote = random.choice(ADMIN_FUN_QUOTES)
-    stats = get_admin_dashboard_stats()
-    await message.answer(
-        f"{quote}\n\n"
-        f"На сейчас: пользователей {stats['users_total']}, заказов {stats['orders_total']}, таблиц {stats['excel_total']}."
-    )
-
-
-@dp.message(Command("ban"))
-async def admin_ban_user(message: Message, bot: Bot) -> None:
-    if not is_admin(message):
-        await message.answer("У тебя нет доступа к этой команде.")
-        return
-
-    parts = (message.text or "").split(maxsplit=2)
-    if len(parts) < 2:
-        await message.answer("Используй формат: /ban user_id причина")
-        return
-
-    try:
-        user_id = int(parts[1].strip())
-    except ValueError:
-        await message.answer("user_id должен быть числом.")
-        return
-
-    if user_id == ADMIN_ID:
-        await message.answer("Главного админа забанить нельзя.")
-        return
-
-    reason = parts[2].strip() if len(parts) >= 3 and parts[2].strip() else "Причина не указана"
-    user = ban_user(user_id, reason)
-    if not user:
-        await message.answer("Пользователь не найден. Сначала он должен написать боту.")
-        return
-
-    try:
-        await bot.send_message(
-            user_id,
-            "Тебе ограничили доступ к боту.\n"
-            f"Причина: {reason}"
-        )
-    except Exception:
-        pass
-
-    await message.answer(
-        f"Пользователь {user_id} забанен.\n"
-        f"Причина: {reason}"
-    )
-
-
-@dp.message(Command("unban"))
-async def admin_unban_user(message: Message, bot: Bot) -> None:
-    if not is_admin(message):
-        await message.answer("У тебя нет доступа к этой команде.")
-        return
-
-    parts = (message.text or "").split(maxsplit=1)
-    if len(parts) < 2:
-        await message.answer("Используй формат: /unban user_id")
-        return
-
-    try:
-        user_id = int(parts[1].strip())
-    except ValueError:
-        await message.answer("user_id должен быть числом.")
-        return
-
-    user = unban_user(user_id)
-    if not user:
-        await message.answer("Пользователь не найден.")
-        return
-
-    try:
-        await bot.send_message(
-            user_id,
-            "Твой доступ к боту восстановлен. Можешь пользоваться им снова."
-        )
-    except Exception:
-        pass
-
-    await message.answer(f"Пользователь {user_id} разбанен.")
-
-
-@dp.message(Command("banned"))
-async def admin_banned_users(message: Message) -> None:
-    if not is_admin(message):
-        await message.answer("У тебя нет доступа к этой команде.")
-        return
-
-    banned_users = get_banned_users()
-    if not banned_users:
-        await message.answer("Сейчас забаненных пользователей нет.")
-        return
-
-    lines = [format_order_card(user) for user in banned_users]
-    await send_long_text(message, "Забаненные пользователи:\n\n" + "\n\n".join(lines))
-
-
-@dp.message(Command("payreq"))
-async def admin_send_payment_details(message: Message, bot: Bot) -> None:
-    if not is_admin(message):
-        await message.answer("У тебя нет доступа к этой команде.")
-        return
-
-    parts = (message.text or "").split(maxsplit=2)
-    if len(parts) < 3:
-        await message.answer("Используй формат: /payreq user_id реквизиты")
-        return
-
-    try:
-        user_id = int(parts[1].strip())
-    except ValueError:
-        await message.answer("user_id должен быть числом.")
-        return
-
-    user = get_user(user_id)
-    if not user:
-        await message.answer("Пользователь не найден.")
-        return
-
-    payment_text = parts[2].strip()
-    if not payment_text:
-        await message.answer("Реквизиты не могут быть пустыми.")
-        return
-
-    try:
-        await bot.send_message(
-            user_id,
-            "Реквизиты для оплаты:\n\n"
-            f"{payment_text}\n\n"
-            "После оплаты пришли сюда чек или сообщение с подтверждением.",
-            reply_markup=payment_keyboard,
-        )
-    except Exception as error:
-        await message.answer(f"Не удалось отправить реквизиты: {error}")
-        return
-
-    payment_users.add(user_id)
-    set_user_status(user_id, "Ожидает оплату")
-    await message.answer(f"Реквизиты отправлены пользователю {user_id}.")
-
-
-@dp.message(Command("paid"))
-async def admin_mark_paid(message: Message, bot: Bot) -> None:
-    if not is_admin(message):
-        await message.answer("У тебя нет доступа к этой команде.")
-        return
-
-    parts = (message.text or "").split(maxsplit=1)
-    if len(parts) < 2:
-        await message.answer("Используй формат: /paid user_id")
-        return
-
-    try:
-        user_id = int(parts[1].strip())
-    except ValueError:
-        await message.answer("user_id должен быть числом.")
-        return
-
-    user = get_user(user_id)
-    if not user:
-        await message.answer("Пользователь не найден.")
-        return
-
-    set_user_status(user_id, "Оплачен")
-    payment_users.discard(user_id)
-    try:
-        await bot.send_message(
-            user_id,
-            "Оплата подтверждена. Спасибо.\n"
-            "Дальше заказ перейдёт в обработку."
-        )
-    except Exception:
-        pass
-
-    await message.answer(f"Оплата пользователя {user_id} подтверждена.")
 
 
 @dp.message(Command("stats"))
@@ -3022,8 +1491,6 @@ async def admin_user_card(message: Message) -> None:
         f"Последняя активность: {user.get('last_seen', '-')}\n"
         f"Страна: {user.get('country', '') or 'Не выбрана'}\n"
         f"Статус: {user.get('status', '') or 'Новый'}\n"
-        f"Бан: {'Да' if user.get('banned') else 'Нет'}\n"
-        f"Причина бана: {user.get('ban_reason', '') or 'Нет'}\n"
         f"Попыток поиска: {int(user.get('search_access', 0) or 0)}\n"
         f"Трек-код: {user.get('tracking_code', '') or 'Нет'}\n"
         f"Этап доставки: {user.get('tracking_stage', '') or 'Нет'}\n"
@@ -3396,7 +1863,6 @@ async def pending_orders_button(message: Message) -> None:
     if not is_admin(message):
         return
 
-    clear_admin_cargo_mode(message)
     pending = get_pending_orders()
     if not pending:
         await message.answer("Неодобренных заказов сейчас нет.")
@@ -3411,7 +1877,6 @@ async def all_orders_button(message: Message) -> None:
     if not is_admin(message):
         return
 
-    clear_admin_cargo_mode(message)
     orders = get_all_orders()
     if not orders:
         await message.answer("Заказов пока нет.")
@@ -3421,14 +1886,6 @@ async def all_orders_button(message: Message) -> None:
     await send_long_text(message, "Все заказы и их статусы:\n\n" + "\n\n".join(lines))
 
 
-@dp.message(F.text == "Оформить заказ")
-async def admin_excel_order_button(message: Message) -> None:
-    if not is_admin(message):
-        return
-
-    await start_admin_cargo_order_flow(message)
-
-
 @dp.message(F.text == "Сделать заказ")
 async def make_order(message: Message) -> None:
     if await maintenance_guard(message):
@@ -3436,7 +1893,6 @@ async def make_order(message: Message) -> None:
     if is_rate_limited(message):
         await maybe_send_rate_limit_notice(message)
         return
-    clear_admin_cargo_mode(message)
     update_user(message, status="Выбирает раздел заказа")
     await send_photo_or_text(
         message,
@@ -3454,7 +1910,6 @@ async def search_item_tab(message: Message) -> None:
         await maybe_send_rate_limit_notice(message)
         return
 
-    clear_admin_cargo_mode(message)
     user = update_user(message)
     if not message.from_user or not user:
         return
@@ -3499,7 +1954,6 @@ async def tariffs(message: Message) -> None:
     if is_rate_limited(message):
         await maybe_send_rate_limit_notice(message)
         return
-    clear_admin_cargo_mode(message)
     update_user(message)
     await send_photo_or_text(
         message,
@@ -3516,7 +1970,6 @@ async def info(message: Message) -> None:
     if is_rate_limited(message):
         await maybe_send_rate_limit_notice(message)
         return
-    clear_admin_cargo_mode(message)
     update_user(message)
     tracking_lookup_users.discard(message.from_user.id if message.from_user else -1)
     await send_photo_or_text(
@@ -3627,16 +2080,11 @@ async def support(message: Message) -> None:
     if is_rate_limited(message):
         await maybe_send_rate_limit_notice(message)
         return
-    clear_admin_cargo_mode(message)
     update_user(message)
-    if message.from_user:
-        support_users.add(message.from_user.id)
     await send_photo_or_text(
         message,
         SUPPORT_IMAGE,
-        "Напиши свой вопрос сюда, и бот сразу перешлёт его в техподдержку.\n"
-        "Можно отправлять текст, фото и файлы.\n"
-        "Чтобы выйти, нажми 'Назад'.",
+        "По всем вопросам техподдержки пиши: @ichov",
     )
 
 
@@ -3647,7 +2095,6 @@ async def china_order(message: Message, bot: Bot) -> None:
     if is_rate_limited(message):
         await maybe_send_rate_limit_notice(message)
         return
-    clear_admin_cargo_mode(message)
     user = update_user(message, country="Китай", status="Оформляет заказ")
     if not message.from_user or not user:
         return
@@ -3672,7 +2119,6 @@ async def other_country_order(message: Message) -> None:
     if is_rate_limited(message):
         await maybe_send_rate_limit_notice(message)
         return
-    clear_admin_cargo_mode(message)
     update_user(message, country=message.text, status="Временно закрыто")
     await message.answer("Временно закрыто.", reply_markup=current_main_keyboard(message))
 
@@ -3690,56 +2136,17 @@ async def finish_china_order(message: Message, bot: Bot) -> None:
         return
 
     order_number = assign_order_number(message.from_user.id)
-    update_user(message, country="Китай", status="Ожидает оплату")
+    update_user(message, country="Китай", status="Заявка отправлена")
     china_order_users.discard(message.from_user.id)
     await message.answer(
-        f"Заказ оформлен. Ваш номер заказа: {order_number}\n"
-        "Чтобы получить реквизиты для оплаты, нажми 'Оплатить заказ'.",
-        reply_markup=payment_keyboard,
+        f"Готово, ожидайте. Ваш номер заказа: {order_number}",
+        reply_markup=current_main_keyboard(message),
     )
     await bot.send_message(
         ADMIN_ID,
         f"Заказ №{order_number}\n"
         f"Пользователь {message.from_user.full_name} "
         f"(ID: {message.from_user.id}) завершил отправку данных по заказу из Китая.",
-    )
-
-
-@dp.message(F.text == "Оплатить заказ")
-async def request_payment_details(message: Message, bot: Bot) -> None:
-    if await maintenance_guard(message):
-        return
-    if is_rate_limited(message):
-        await maybe_send_rate_limit_notice(message)
-        return
-    if not message.from_user:
-        return
-
-    user = get_user(message.from_user.id)
-    if not user or not (
-        user.get("order_number", 0)
-        or user.get("status") in {"Ожидает оплату", "Оплата на проверке", "Оплачен"}
-    ):
-        update_user(message)
-        await message.answer("Сначала оформи заказ, а потом запрашивай оплату.")
-        return
-
-    payment_users.add(message.from_user.id)
-    update_user(message, status="Ожидает оплату")
-    await message.answer(
-        "Запрос на оплату отправлен администратору.\n"
-        "Как только админ пришлёт реквизиты, бот пересылает их сюда.\n"
-        "После оплаты отправь сюда чек или подтверждение.",
-        reply_markup=payment_keyboard,
-    )
-    await bot.send_message(
-        ADMIN_ID,
-        "Запрос на оплату:\n\n"
-        f"ID: {message.from_user.id}\n"
-        f"Имя: {message.from_user.full_name}\n"
-        f"Номер заказа: {user.get('order_number', 0) or 'Нет'}\n\n"
-        "Отправь реквизиты командой:\n"
-        f"/payreq {message.from_user.id} ТВОИ_РЕКВИЗИТЫ"
     )
 
 
@@ -3756,10 +2163,6 @@ async def back_to_main_menu(message: Message) -> None:
         admin_search_users.discard(message.from_user.id)
         paid_search_users.discard(message.from_user.id)
         tracking_lookup_users.discard(message.from_user.id)
-        support_users.discard(message.from_user.id)
-        payment_users.discard(message.from_user.id)
-        reset_admin_cargo_order_state(message.from_user.id)
-        reset_admin_message_order_state(message.from_user.id)
     user_name = message.from_user.first_name if message.from_user else "друг"
     await send_main_menu(message, user_name)
 
@@ -3775,41 +2178,6 @@ async def handle_messages(message: Message, bot: Bot) -> None:
     update_user(message)
 
     if not message.from_user:
-        return
-
-    if await handle_admin_message_order_step(message, bot):
-        return
-
-    if await handle_admin_cargo_order_step(message, bot):
-        return
-
-    if message.from_user.id in support_users and not is_admin(message):
-        update_user(message, status="В техподдержке")
-        await notify_admin_support(bot, message)
-        await bot.forward_message(ADMIN_ID, message.chat.id, message.message_id)
-        await message.answer(
-            "Сообщение отправлено в техподдержку.\n"
-            "Если нужно, можешь написать ещё или нажать 'Назад'."
-        )
-        return
-
-    if message.from_user.id in payment_users and not is_admin(message):
-        update_user(message, status="Оплата на проверке")
-        await bot.send_message(
-            ADMIN_ID,
-            "Поступило подтверждение оплаты:\n\n"
-            f"ID: {message.from_user.id}\n"
-            f"Имя: {message.from_user.full_name}\n"
-            "Проверь сообщение ниже.\n"
-            f"Чтобы подтвердить оплату, используй /paid {message.from_user.id}"
-        )
-        await bot.forward_message(ADMIN_ID, message.chat.id, message.message_id)
-        payment_users.discard(message.from_user.id)
-        await message.answer(
-            "Подтверждение оплаты отправлено администратору.\n"
-            "Ожидай проверки.",
-            reply_markup=current_main_keyboard(message),
-        )
         return
 
     if message.from_user.id in admin_search_users and is_admin(message):
@@ -3901,29 +2269,9 @@ async def handle_messages(message: Message, bot: Bot) -> None:
                 "/revokesearch user_id\n"
                 "/searchlist\n"
                 "/status user_id статус\n"
-                "/dashboard\n"
-                "/ban user_id причина\n"
-                "/unban user_id\n"
-                "/banned\n"
-                "/payreq user_id реквизиты\n"
-                "/paid user_id\n"
                 "/owner код\n"
                 "/broadcast текст\n"
                 "/maintenance on|off\n"
-                "/excelorder\n"
-                "/newexcelorder\n"
-                "/messageorder\n"
-                "/excelfiles\n"
-                "/activeexcel\n"
-                "/setactiveexcel номер\n"
-                "/closeexcel\n"
-                "/excelsend current\n"
-                "/excelview номер\n"
-                "/exceldelete номер\n"
-                "/exceledit current строка поле значение\n"
-                "/cargostats\n"
-                "/randomuser\n"
-                "/adminfun\n"
                 "/find название вещи\n"
                 "/track код\n"
                 "/trackset код этап\n"
@@ -3948,9 +2296,7 @@ async def main() -> None:
     init_db()
     migrate_legacy_users()
     purge_canceled_orders()
-    ensure_storage_dirs()
     bot = Bot(token=TOKEN)
-    await setup_bot_commands(bot)
     await dp.start_polling(bot)
 
 
