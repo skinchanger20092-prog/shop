@@ -132,6 +132,9 @@ admin_main_keyboard = ReplyKeyboardMarkup(
 user_order_keyboard = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="Китай")],
+        [KeyboardButton(text="Япония")],
+        [KeyboardButton(text="Корея")],
+        [KeyboardButton(text="США")],
         [KeyboardButton(text="Найти эту вещь в Китае")],
         [KeyboardButton(text="Назад")],
     ],
@@ -209,6 +212,9 @@ admin_main_keyboard = ReplyKeyboardMarkup(
 user_order_keyboard = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="Китай")],
+        [KeyboardButton(text="Япония")],
+        [KeyboardButton(text="Корея")],
+        [KeyboardButton(text="США")],
         [KeyboardButton(text="Найти эту вещь в Китае")],
         [KeyboardButton(text="Назад")],
     ],
@@ -2805,12 +2811,18 @@ async def tariffs(message: Message) -> None:
     await send_photo_or_text(
         message,
         TARIFF_IMAGE,
-        "НАШ ТАРИФ, что он включает?!\n"
-        "он включает два вида доставки\n\n"
-        "1.Китай-Благовещенск-Керчь\n"
-        "2.Китай-Москва-Керчь\n\n"
-        "Ценник фиксированный - 6$ за кг\n\n"
-        "ДОСТАВКА СДЭК ОПЛАЧИВАЕТСЯ ОТДЕЛЬНО",
+        "ТАРИФЫ ДОСТАВОК С РАЗНЫХ СТРАН\n\n"
+        "Для Китая\n"
+        "Доставка 7,5$/кг 🚛\n"
+        "~18 дней 🇨🇳\n\n"
+        "Для Кореи\n"
+        "Доставка 1500₽/кг 🌐\n"
+        "Со склада в Корее до РФ ~12 дней 🚛\n\n"
+        "Для Японии\n"
+        "Доставка 1800₽/кг 🚛\n"
+        "~18 дней ⏳\n\n"
+        "Для США\n"
+        "Стоимость выкупа в рублях определяется индивидуально.",
     )
     return
     await send_photo_or_text(
@@ -3040,6 +3052,36 @@ async def select_china_tariff(message: Message, bot: Bot) -> None:
     )
 
 
+@dp.message(F.text.in_(["Япония", "Корея", "США"]))
+async def other_country_order(message: Message, bot: Bot) -> None:
+    if await maintenance_guard(message):
+        return
+    if is_rate_limited(message):
+        await maybe_send_rate_limit_notice(message)
+        return
+    if not message.from_user:
+        return
+
+    country = message.text
+    user = update_user(message, country=country, tariff="", status="Оформляет заказ")
+    if not user:
+        return
+
+    china_order_users.add(message.from_user.id)
+    tracking_lookup_users.discard(message.from_user.id)
+    await message.answer(
+        f"Выбрана страна: {country}.\n"
+        "Теперь скидывай ссылку товара, фото товара, размер, цвет и остальные данные по заказу.",
+        reply_markup=china_submit_keyboard,
+    )
+    await bot.send_message(
+        ADMIN_ID,
+        f"Пользователь {message.from_user.full_name} "
+        f"(ID: {message.from_user.id}) начал заказ.\n"
+        f"Страна: {country}",
+    )
+
+
 @dp.message(F.text == "Я все скинул")
 async def finish_china_order(message: Message, bot: Bot) -> None:
     if await maintenance_guard(message):
@@ -3049,11 +3091,13 @@ async def finish_china_order(message: Message, bot: Bot) -> None:
         return
     if not message.from_user or message.from_user.id not in china_order_users:
         update_user(message)
-        await message.answer("Сначала выбери раздел 'Сделать заказ', затем 'Китай' и тариф доставки.")
+        await message.answer("Сначала выбери раздел 'Сделать заказ' и страну.")
         return
 
     order_number = assign_order_number(message.from_user.id)
-    user = update_user(message, country="Китай", status="Заявка отправлена")
+    previous_user = get_user(message.from_user.id) or {}
+    country = previous_user.get("country", "") or "Не выбрана"
+    user = update_user(message, status="Заявка отправлена")
     china_order_users.discard(message.from_user.id)
     tariff = (user or {}).get("tariff", "") or "Не выбран"
     await message.answer(
@@ -3064,7 +3108,8 @@ async def finish_china_order(message: Message, bot: Bot) -> None:
         ADMIN_ID,
         f"Заказ №{order_number}\n"
         f"Пользователь {message.from_user.full_name} "
-        f"(ID: {message.from_user.id}) завершил отправку данных по заказу из Китая.\n"
+        f"(ID: {message.from_user.id}) завершил отправку данных по заказу.\n"
+        f"Страна: {country}\n"
         f"Тариф: {tariff}",
     )
 
